@@ -9,6 +9,8 @@ import threading
 import datetime
 import redis
 import psycopg2
+import pandas as pd
+
 import psycopg2.extras
 from utils.logger import setup_logger
 import config.config_db as db_config
@@ -41,6 +43,8 @@ class PostgresDBBot:
 
         # Create tables if they do not exist
         self._create_tables()
+        # Now alter the kline_data table to include indicator columns
+        self._alter_table_for_indicators()
         # Redis Pub/Sub
         self.redis_client = redis.Redis(
             host=ws_config.REDIS_HOST,
@@ -54,6 +58,29 @@ class PostgresDBBot:
 
         # Control flag for run loop
         self.running = True
+    def _alter_table_for_indicators(self):
+        """Alter kline_data table to add columns for technical indicators if they do not exist."""
+        alter_sqls = [
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS rsi NUMERIC(8,4);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd NUMERIC(18,8);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd_signal NUMERIC(18,8);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd_hist NUMERIC(18,8);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS ma NUMERIC(18,8);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS upper_band NUMERIC(18,8);",
+            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS lower_band NUMERIC(18,8);"
+        ]
+        cursor = self.conn.cursor()
+        try:
+            for sql in alter_sqls:
+                cursor.execute(sql)
+            self.conn.commit()
+            self.logger.info("Table 'kline_data' altered successfully for technical indicators.")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"Error altering table for indicators: {e}")
+        finally:
+            cursor.close()
+
     def _create_tables(self):
         """
         Create tables for kline, order book, trades, etc.
@@ -250,6 +277,8 @@ class PostgresDBBot:
             # Store in DB
             self.store_kline_data(symbol, interval, start_dt, open_price, close_price,
                                   high_price, low_price, volume, turnover, confirmed)
+            # Compute and update technical indicators for this symbol and interval.
+            self.update_indicators_for_symbol(symbol, interval)                                  
         except KeyError as e:
             self.logger.error(f"Missing key in kline update: {e}")
 
@@ -275,7 +304,62 @@ class PostgresDBBot:
             self.store_trade_data(symbol, trade_dt, price, volume)
         except KeyError as e:
             self.logger.error(f"Missing key in trade update: {e}")
+    def update_indicators_for_symbol(self, symbol, interval):
+        """
+        Query all kline_data rows for a given symbol and interval, compute technical
+        indicators (RSI, MACD, MA, Bollinger Bands), and update the table rows.
+        """
+        query = """
+        SELECT id, start_time, open, close, high, low, volume, turnover
+        FROM kline_data
+        WHERE symbol = %s AND interval = %s
+        ORDER BY start_time ASC;
+        """
+        try:
+            df = pd.read_sql(query, self.conn, params=(symbol, interval))
+        except Exception as e:
+            self.logger.error(f"Error reading kline data for {symbol} {interval}: {e}")
+            return
 
+        if df.empty:
+            self.logger.info(f"No kline data to compute indicators for {symbol} {interval}")
+            return
+
+        # Compute technical indicators on the DataFrame (assuming compute_indicators is defined)
+        df = self.compute_indicators(df)
+
+        # Now update each row with the computed values
+        update_sql = """
+        UPDATE kline_data
+        SET rsi = %s,
+            macd = %s,
+            macd_signal = %s,
+            macd_hist = %s,
+            ma = %s,
+            upper_band = %s,
+            lower_band = %s
+        WHERE id = %s;
+        """
+        cursor = self.conn.cursor()
+        try:
+            for index, row in df.iterrows():
+                cursor.execute(update_sql, (
+                    row.get("RSI"),
+                    row.get("MACD"),
+                    row.get("MACD_Signal"),
+                    row.get("MACD_Hist"),
+                    row.get("MA"),
+                    row.get("UpperBand"),
+                    row.get("LowerBand"),
+                    row["id"]
+                ))
+            self.conn.commit()
+            self.logger.info(f"Indicators updated for {symbol} {interval}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"Error updating indicators for {symbol} {interval}: {e}")
+        finally:
+            cursor.close()
     def handle_orderbook_update(self, odata):
         """
         Expects something like:
@@ -315,6 +399,70 @@ class PostgresDBBot:
         if self.conn:
             self.conn.close()
         self.logger.info("DB Bot Stopped.")
+    def compute_wilder_rsi_loop(self,prices, period=14):
+        """
+        Compute the Relative Strength Index (RSI) using Wilder's smoothing method.
+        Returns a list of RSI values.
+        """
+        if len(prices) < period + 1:
+            return [None] * len(prices)
+        
+        rsi = [None] * len(prices)
+        gains = []
+        losses = []
+        
+        # Initial averages
+        for i in range(1, period + 1):
+            change = prices[i] - prices[i - 1]
+            gains.append(max(change, 0))
+            losses.append(abs(min(change, 0)))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+        rsi[period] = 100 - (100 / (1 + rs))
+        
+        # Apply Wilder's smoothing
+        for i in range(period + 1, len(prices)):
+            change = prices[i] - prices[i - 1]
+            gain = max(change, 0)
+            loss = abs(min(change, 0))
+            avg_gain = (avg_gain * (period - 1) + gain) / period
+            avg_loss = (avg_loss * (period - 1) + loss) / period
+            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+            rsi[i] = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+    def compute_indicators(self,df):
+        """
+        Given a DataFrame with a 'close' column, compute technical indicators:
+        - RSI (using a 14-period Wilder smoothing)
+        - MACD, MACD Signal, and MACD Histogram (using spans of 12, 26, and 9)
+        - A 20-period Moving Average (MA)
+        - Bollinger Bands (Upper and Lower) calculated as MA ± 2 * STD
+        Returns the DataFrame with new columns added.
+        """
+        # Compute RSI. Convert the close column to a list.
+        df['RSI'] = self.compute_wilder_rsi_loop(df['close'].tolist(), period=14)
+        
+        # Compute MACD and its signal line
+        df['EMA12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['EMA26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = df['EMA12'] - df['EMA26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+        
+        # Compute Moving Average and Bollinger Bands (20-period window)
+        df['MA'] = df['close'].rolling(window=20).mean()
+        df['STD'] = df['close'].rolling(window=20).std()
+        df['UpperBand'] = df['MA'] + 2 * df['STD']
+        df['LowerBand'] = df['MA'] - 2 * df['STD']
+        
+        # Optionally, drop the intermediate columns if you don't need them:
+        df.drop(columns=['EMA12', 'EMA26', 'STD'], inplace=True)
+        
+        return df
+
 if __name__ == "__main__":
     # Example usage
     db_bot = PostgresDBBot("DB_BOT.log")

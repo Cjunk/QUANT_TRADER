@@ -74,7 +74,7 @@ def display_book_summary(symbol="BTCUSDT", bucket_size=10, refresh=2):
         time.sleep(refresh)
 
 if __name__ == "__main__":
-    display_book_summary(symbol="BTCUSDT", bucket_size=10, refresh=2)
+    display_book_summary(symbol="SOLUSDT", bucket_size=10, refresh=2)
 
 
 

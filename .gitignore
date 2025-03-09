@@ -1,0 +1,6 @@
+# Ignore config files and environment variables
+config*
+*.env
+fun_trade_bot.py
+*.logs
+venv/

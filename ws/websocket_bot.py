@@ -1,0 +1,299 @@
+import websocket
+import threading
+import json
+import redis
+import time
+import logging
+import requests
+import datetime
+import config.config_ws as config
+from utils.logger import setup_logger
+
+class WebSocketBot:
+    """📡 High-Performance WebSocket Bot for Bybit (Quant Trading Ready)."""
+
+    def __init__(self):
+        self.logger = setup_logger(config.LOG_FILENAME)
+        self.running = True  # Control flag
+        self.last_trade_log_time = {}  # Track last trade log per symbol
+        self.redis_client = redis.Redis(
+            host=config.REDIS_HOST,
+            port=config.REDIS_PORT,
+            db=config.REDIS_DB,
+            decode_responses=True
+        )
+        # Optional: track last snapshot time to periodically refresh
+        self.last_snapshot_time = {}
+        self.webhook = config.WEBHOOK
+        self.userid = '360612543443501056' 
+        self.send_webhook(f"Websocket bot has <@{self.userid}> started .....")
+    
+    def subscribe_in_batches(self,ws, subscriptions, batch_size=10):
+        """
+        Flatten the subscriptions dictionary into a single list of channels,
+        then send subscribe messages in batches of size 'batch_size'.
+        """
+        # Flatten the channels from the "spot" subscriptions.
+        self.logger.info(f"✅ subscribe_in_batches execution 1 {subscriptions}")
+        channels = []
+        for key, channel_list in config.SUBSCRIPTIONS["spot"].items():
+            channels.extend(channel_list)
+
+        print(f"[DEBUG] Total channels to subscribe: {len(channels)}")
+        for idx, channel in enumerate(channels):
+            print(f"[DEBUG] Channel {idx}: {channel}")
+
+        # Send subscribe messages in batches.
+        for i in range(0, len(channels), batch_size):
+            batch = channels[i:i+batch_size]
+            msg = {"op": "subscribe", "args": batch}
+            try:
+                ws.send(json.dumps(msg))
+                print(f"[DEBUG] Sent subscribe message for batch: {batch}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send subscribe message for batch {batch}: {e}")
+    def send_webhook(self,message):
+        data = {
+            "content": message,
+            "username": "Webby01",  # Optional: custom username
+            # "embeds": []        # Optionally add embeds
+        }
+        response = requests.post(self.webhook, json=data)
+        if response.status_code == 204:
+            self.logger.info("Discord Message sent successfully!")
+        else:
+            self.logger.info("Failed to send message:", response.text)
+    def fetch_order_book_snapshot(self, symbol):
+        """📸 Fetches full depth order book snapshot from Bybit API."""
+        url = "https://api.bybit.com/v5/market/orderbook"
+        params = {"category": "spot", "symbol": symbol, "limit": 200}  # ✅  levels
+
+        try:
+            response = requests.get(url, params=params)
+            data = response.json()
+            if "result" in data and "b" in data["result"] and "a" in data["result"]:
+                bids = [(float(bid[0]), float(bid[1])) for bid in data["result"]["b"]]
+                asks = [(float(ask[0]), float(ask[1])) for ask in data["result"]["a"]]
+
+                # ✅ Store full snapshot in Redis
+                self.redis_client.delete(f"orderbook:{symbol}:bids")
+                self.redis_client.delete(f"orderbook:{symbol}:asks")
+                for price, volume in bids:
+                    self.redis_client.zadd(f"orderbook:{symbol}:bids", {str(price): volume})
+                for price, volume in asks:
+                    self.redis_client.zadd(f"orderbook:{symbol}:asks", {str(price): volume})
+
+                self.logger.info(f"✅ Full Order Book Snapshot Loaded for {symbol}")
+                self.last_snapshot_time[symbol] = time.time()  # record snapshot time
+            else:
+                self.logger.warning(f"⚠️ Failed to fetch order book snapshot for {symbol}")
+        except Exception as e:
+            self.logger.error(f"❌ Error fetching order book snapshot for {symbol}: {e}")
+    def start(self):
+        """🚀 Start WebSocket connections."""
+        for symbol in config.SYMBOLS:  # 
+            self.fetch_order_book_snapshot(symbol)
+
+        for url, subs, name in [
+            (config.SPOT_WEBSOCKET_URL, config.SUBSCRIPTIONS["spot"], "Spot")
+        ]:
+            threading.Thread(
+                target=self._run_websocket,
+                args=(url, subs, name),
+                daemon=True
+            ).start()             
+    def _run_websocket(self, url, subs, name):
+        """🔄 Handle WebSocket connection."""
+        while self.running:
+            try:
+                ws = websocket.WebSocketApp(
+                    url,
+                    on_open=lambda ws: self._on_open(ws, subs, name),
+                    on_message=lambda ws, msg: self._on_message(ws, msg, name),
+                    on_error=lambda ws, err: self.logger.error(f"❌ {name} WebSocket error: {err}"),
+                    on_close=lambda ws, *_: self.logger.warning("🔴 WebSocket disconnected. Reconnecting...")
+                )
+                ws.run_forever(ping_interval=30)
+            except Exception as e:
+                self.logger.error(f"❌ {name} WebSocket error: {e}")
+                time.sleep(config.RECONNECT_DELAY)
+
+    def _on_open(self, ws, subs, name):
+        """📡 Subscribe to WebSocket feeds."""
+        self.subscribe_in_batches(ws, subs, batch_size=10)
+        self.logger.info(f"✅ =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- Subscribed to Bybit {name} WebSocket feeds! =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-")
+
+    def _on_message(self, ws, message, name):
+        """📥 Handle incoming WebSocket messages."""
+
+        try:
+            data = json.loads(message)
+            topic = data.get("topic", "")
+            
+            if "publicTrade" in topic:
+                self._process_trade(data)
+            elif "orderbook" in topic:
+                
+                self._process_order_book(data)
+            elif "kline" in topic: #TODO REMEMBER this must loop through the symbols found in data and not assume BTCUSD
+                candle = data["data"][0]
+                confirm_flag = candle["confirm"]
+                if confirm_flag:
+                    
+                    interval = candle["interval"]
+                    
+                    volume = candle["volume"]
+                    turnover = candle["turnover"]
+                    start_dt = datetime.datetime.utcfromtimestamp(float(candle["start"]) / 1000.0)
+                    symbol = topic.split(".")[-1]                    
+                    #self.logger.info(f">   >   >   ****************************   Kline 1 data detected {confirm_flag}")
+                    #self.logger.info(f"{message}")
+                    # Publish a test message
+                    kline_data = {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "start_time": start_dt.isoformat(),  # ISO formatted string
+                        "open": candle["open"],
+                        "close": candle["close"],
+                        "high": candle["high"],
+                        "low": candle["low"],
+                        "volume": volume,
+                        "turnover": turnover,
+                        "confirmed": True
+                    }
+                    self.redis_client.publish("kline_updates",json.dumps(kline_data))
+
+            elif "kline.5" in topic:
+                candle = data["data"][0]
+                interval = candle["interval"]
+                confirm_flag = candle["confirm"]
+                if confirm_flag:
+                    self.logger.info(f">   >   >   ****************************   Kline 5 data detected {confirm_flag}")                    
+            elif "kline.60" in topic:
+                candle = data["data"][0]
+                interval = candle["interval"]
+                confirm_flag = candle["confirm"]
+                if confirm_flag:
+                    self.logger.info(f">   >   >   ****************************   Kline 60 data detected {confirm_flag}")
+            elif "kline.D" in topic:
+                candle = data["data"][0]
+                interval = candle["interval"]
+                confirm_flag = candle["confirm"]
+                if confirm_flag:
+                    self.logger.info(f">   >   >   ****************************   Kline D data detected {confirm_flag}")                     
+
+        except json.JSONDecodeError:
+            self.logger.error(f"❌ Failed to decode {name} WebSocket message.")
+
+    def _process_trade(self, data):
+        """🔄 Process trade data (Efficient storage)."""
+        trade = data["data"][-1]
+        symbol, price, volume, trade_time = (
+            trade["s"],
+            float(trade["p"]),
+            float(trade["v"]),
+            int(trade["T"]) / 1000
+        )
+        system_time = time.time()
+        delay = system_time - trade_time
+        if delay < 0:
+            delay = 0
+        if delay > 5:
+            return  # Skip stale trades
+
+        # ✅ Store latest price
+        self.redis_client.set(f"latest_trade:{symbol}", price)
+
+        # ✅ Store recent trades (LPUSH the last 100)
+        self.redis_client.lpush(
+            f"trades:{symbol}",
+            json.dumps({"price": price, "volume": volume, "time": trade_time})
+        )
+        self.redis_client.ltrim(f"trades:{symbol}", 0, 99)
+
+        # ✅ Log only every 10 seconds per symbol
+        if system_time - self.last_trade_log_time.get(symbol, 0) >= config.LOG_TRADE_PRICE_PERIOD:
+            self.logger.info(f"🟢 {symbol} Trade | Price: {price:.2f} | Delay: {delay:.2f}s")
+            self.last_trade_log_time[symbol] = system_time
+
+    def update_order_book(self, symbol, bids, asks):
+            """🔄 Merge incremental order book updates into Redis for a given symbol."""
+            redis_key_bids = f"orderbook:{symbol}:bids"
+            redis_key_asks = f"orderbook:{symbol}:asks"
+
+            # Load existing order book data from Redis
+            existing_bids = {
+                float(price): float(vol)
+                for price, vol in self.redis_client.zrange(redis_key_bids, 0, -1, withscores=True)
+            }
+            existing_asks = {
+                float(price): float(vol)
+                for price, vol in self.redis_client.zrange(redis_key_asks, 0, -1, withscores=True)
+            }
+            #self.logger.debug(f"[{symbol}] Before update: {len(existing_bids)} bids, {len(existing_asks)} asks.")
+
+            # Update bids
+            for p, v in bids:
+                price = float(p)
+                volume = float(v)
+                if volume <= 0:
+                    existing_bids.pop(price, None)  # Remove zero volume
+                else:
+                    existing_bids[price] = volume
+
+            # Update asks
+            for p, v in asks:
+                price = float(p)
+                volume = float(v)
+                if volume <= 0:
+                    existing_asks.pop(price, None)
+                else:
+                    existing_asks[price] = volume
+
+            #self.logger.debug(f"[{symbol}] After update: {len(existing_bids)} bids, {len(existing_asks)} asks.")
+
+            # Store updated order book back into Redis
+            self.redis_client.delete(redis_key_bids)
+            self.redis_client.delete(redis_key_asks)
+            if existing_bids:
+                self.redis_client.zadd(redis_key_bids, {str(p): v for p, v in existing_bids.items()})
+            if existing_asks:
+                self.redis_client.zadd(redis_key_asks, {str(p): v for p, v in existing_asks.items()})
+
+    def _process_order_book(self, data):
+        """🔄 Handle incremental order book updates and log debugging info."""
+        raw_topic = data.get("topic", "")
+        #self.logger.debug(f"Received order book update. Raw topic: {raw_topic}")
+        # Expect topic format like "orderbook.200.BTCUSDT" or "orderbook.200.SOLUSDT"
+        symbol = raw_topic.split(".")[-1]
+        #self.logger.debug(f"Extracted symbol: {symbol}")
+        ob = data.get("data", {})
+        if not ob.get("b") or not ob.get("a"):
+            #self.logger.warning(f"No bids or asks found in update for {symbol}: {data}")
+            return
+
+        # Update Redis order book
+        self.update_order_book(symbol, ob["b"], ob["a"])
+        #self.logger.info(f"[{symbol}] Order book updated.")
+
+        # Log top levels periodically (every 30 seconds)
+        if time.time() - self.last_trade_log_time.get(symbol, 0) >= 30:
+            redis_key_bids = f"orderbook:{symbol}:bids"
+            redis_key_asks = f"orderbook:{symbol}:asks"
+            top_bid = self.redis_client.zrange(redis_key_bids, -1, -1, withscores=True)
+            top_ask = self.redis_client.zrange(redis_key_asks, 0, 0, withscores=True)
+            #self.logger.info(f"[{symbol}] Top Bid: {top_bid} | Top Ask: {top_ask}")
+            self.last_trade_log_time[symbol] = time.time()
+
+        # Refresh snapshot every 60 seconds to avoid stale data.
+        if (time.time() - self.last_snapshot_time.get(symbol, 0)) > 30:
+            self.logger.info(f"Refreshing snapshot for {symbol}")
+            self.fetch_order_book_snapshot(symbol)
+
+    def stop(self):
+        """⏹ Stop the WebSocket bot."""
+        self.running = False
+        self.logger.info("🛑 WebSocket Bot Stopped.")
+        self.send_webhook("Websocket bot has stopped.")
+
+

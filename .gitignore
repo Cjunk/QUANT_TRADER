@@ -3,4 +3,6 @@ config*
 *.env
 fun_trade_bot.py
 *.logs
+*.log
+logs*
 venv/

@@ -131,6 +131,7 @@ class WebSocketBot:
             topic = data.get("topic", "")
             
             if "publicTrade" in topic:
+
                 self._process_trade(data)
             elif "orderbook" in topic:
                 
@@ -195,21 +196,21 @@ class WebSocketBot:
             int(trade["T"]) / 1000
         )
         system_time = time.time()
-        delay = system_time - trade_time
-        if delay < 0:
-            delay = 0
+        delay = max(0, system_time - trade_time)  # Prevent negative delay
         if delay > 5:
             return  # Skip stale trades
 
         # ✅ Store latest price
         self.redis_client.set(f"latest_trade:{symbol}", price)
-
+        
         # ✅ Store recent trades (LPUSH the last 100)
         self.redis_client.lpush(
             f"trades:{symbol}",
             json.dumps({"price": price, "volume": volume, "time": trade_time})
         )
-        self.redis_client.ltrim(f"trades:{symbol}", 0, 99)
+        self.redis_client.ltrim(f"trades:{symbol}", 0, 999)
+        # ✅ Publish trade event for PostgreSQL service bot
+        self.redis_client.publish(f"trade_channel", json.dumps({"symbol": symbol, "trade": data}))
 
         # ✅ Log only every 10 seconds per symbol
         if system_time - self.last_trade_log_time.get(symbol, 0) >= config.LOG_TRADE_PRICE_PERIOD:

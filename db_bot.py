@@ -10,7 +10,7 @@ import datetime
 import redis
 import psycopg2
 import pandas as pd
-
+from sqlalchemy import create_engine
 import psycopg2.extras
 from utils.logger import setup_logger
 import config.config_db as db_config
@@ -28,7 +28,13 @@ class PostgresDBBot:
         self.port = db_config.DB_PORT
         self.database = db_config.DB_DATABASE
         self.user = db_config.DB_USER
-        # Connect to Postgres
+        # ✅ Use SQLAlchemy to create a database engine
+        self.db_engine = create_engine(
+            f"postgresql://{self.user}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
+        )
+        print("Database Bot (Postgresql) is running .......")
+        # Use DictCursor or NamedTupleCursor if you prefer
+         # ✅ 1️⃣ Keep psycopg2 for your existing queries
         self.conn = psycopg2.connect(
             host=self.host,
             port=self.port,
@@ -36,8 +42,6 @@ class PostgresDBBot:
             user=self.user,
             password=db_config.DB_PASSWORD
         )
-        print("Database Bot (Postgresql) is running .......")
-        # Use DictCursor or NamedTupleCursor if you prefer
         self.conn.autocommit = False  # Or True, if you want auto-commit
         self.logger.info(f"Connected to Postgres @ {self.host}:{self.port}/{self.database}")
 
@@ -54,7 +58,7 @@ class PostgresDBBot:
         )
         self.pubsub = self.redis_client.pubsub()
         # Subscribe to channels (adjust names as needed)
-        self.pubsub.subscribe("kline_updates", "trade_updates", "orderbook_updates")
+        self.pubsub.subscribe("kline_updates", "trade_channel", "orderbook_updates")
 
         # Control flag for run loop
         self.running = True
@@ -234,7 +238,7 @@ class PostgresDBBot:
 
                 if channel == "kline_updates":
                     self.handle_kline_update(data_obj)
-                elif channel == "trade_updates":
+                elif channel == "trade_channel":
                     self.handle_trade_update(data_obj)
                 elif channel == "orderbook_updates":
                     self.handle_orderbook_update(data_obj)
@@ -284,26 +288,62 @@ class PostgresDBBot:
 
     def handle_trade_update(self, tdata):
         """
-        Expects a JSON object like:
-        {
-          "symbol": "BTCUSDT",
-          "time": 1677600123,    # epoch seconds
-          "price": 23456.78,
-          "volume": 0.1234
-        }
+        ✅ Store only large trades in PostgreSQL.
         """
         try:
+            #print(f"📥 Trade received: {tdata}")  # Debugging
+
+            # ✅ Extract the actual trade information
+            if "trade" in tdata and "data" in tdata["trade"] and len(tdata["trade"]["data"]) > 0:
+                trade_info = tdata["trade"]["data"][0]  # ✅ Get the latest trade
+            else:
+                print(f"🚨 ERROR: Invalid trade format: {tdata}")  # Debugging
+                return  # 🚨 Skip this trade
+
             symbol = tdata["symbol"]
-            trade_time = tdata["time"]
-            price = float(tdata["price"])
-            volume = float(tdata["volume"])
+            trade_time = trade_info["T"]  
+            price = float(trade_info["p"])  
+            volume = float(trade_info["v"])  
 
-            import datetime
-            trade_dt = datetime.datetime.utcfromtimestamp(trade_time)
+            trade_dt = datetime.datetime.utcfromtimestamp(trade_time / 1000)  
 
-            self.store_trade_data(symbol, trade_dt, price, volume)
+            # ✅ Set a threshold per coin (Modify as needed)
+            large_trade_thresholds = {
+                "BTCUSDT": 5,    # ✅ BTC large trades are usually 5+ BTC
+                "ETHUSDT": 50,   # ✅ ETH large trades start at ~50 ETH
+                "SOLUSDT": 500,  # ✅ SOL is volatile, large trades are ~500 SOL
+                "ADAUSDT": 5000, # ✅ ADA needs ~5000 ADA to be significant
+                "DOTUSDT": 2000, # ✅ DOT large trades are 2000 DOT+
+                "DOGEUSDT": 100000, # ✅ DOGE is high supply, needs 100k+ DOGE
+                "XRPUSDT": 50000, # ✅ XRP whale trades start at 50k+
+                "BNBUSDT": 100,  # ✅ BNB large trades ~100 BNB
+                "LTCUSDT": 500,  # ✅ LTC large trades ~500 LTC
+                "LINKUSDT": 2000, # ✅ LINK large trades ~2000 LINK
+                "TRXUSDT": 100000, # ✅ TRX needs 100k+ to be significant
+                "XLMUSDT": 50000,  # ✅ XLM whale trades ~50k XLM
+                "ATOMUSDT": 1000,  # ✅ ATOM large trades ~1000 ATOM
+                "ALGOUSDT": 100000, # ✅ ALGO needs 100k+
+                "PEPEUSDT": 1000000000, # ✅ Meme coins are extreme
+                "AVAXUSDT": 1000,  # ✅ AVAX large trades ~1000 AVAX
+                "UNIUSDT": 1000,   # ✅ UNI whale trades ~1000 UNI
+                "SUSDT": 5000,     # ✅ Assuming this is a lower cap coin
+                "NEARUSDT": 5000,  # ✅ NEAR large trades ~5000 NEAR
+                "ICPUSDT": 3000,   # ✅ ICP large trades ~3000 ICP
+            }
+
+            threshold = large_trade_thresholds.get(symbol, 10)  # Default threshold = 10
+
+            # ✅ Only store large trades
+            if volume >= threshold:
+                #print(f"✅ Storing large trade in DB: {symbol} | {volume} units @ {price}")  # Debugging
+                self.store_trade_data(symbol, trade_dt, price, volume)
+
         except KeyError as e:
-            self.logger.error(f"Missing key in trade update: {e}")
+            self.logger.error(f"🚨 Missing key in trade update: {e}")
+            print(f"🚨 ERROR: Missing key {e} in trade data: {tdata}")  # Debugging
+
+
+
     def update_indicators_for_symbol(self, symbol, interval):
         """
         Query all kline_data rows for a given symbol and interval, compute technical
@@ -316,7 +356,7 @@ class PostgresDBBot:
         ORDER BY start_time ASC;
         """
         try:
-            df = pd.read_sql(query, self.conn, params=(symbol, interval))
+            df = pd.read_sql(query, self.db_engine, params=(symbol, interval))
         except Exception as e:
             self.logger.error(f"Error reading kline data for {symbol} {interval}: {e}")
             return

@@ -122,7 +122,7 @@ def print_summary(df):
 
 if __name__ == "__main__":
     SYMBOL = "BTCUSDT"
-    INTERVAL = "5"  # 5-minute candles
+    INTERVAL = "1"  # 5-minute candles
     
     # Load data from PostgreSQL
     df = load_historical_klines(SYMBOL, INTERVAL)

@@ -14,7 +14,7 @@ def bucket_orders(orders, bucket_size=10):
         bucketed[floor_price] = bucketed.get(floor_price, 0) + volume
     return bucketed
 
-def display_book_summary(symbol="BTCUSDT", bucket_size=10, refresh=2):
+def display_book_summary(symbol, bucket_size=10, refresh=2):
     """
     - Fetches all bids/asks (depth=9999).
     - Buckets them in `bucket_size` increments.
@@ -74,7 +74,7 @@ def display_book_summary(symbol="BTCUSDT", bucket_size=10, refresh=2):
         time.sleep(refresh)
 
 if __name__ == "__main__":
-    display_book_summary(symbol="SOLUSDT", bucket_size=10, refresh=2)
+    display_book_summary(symbol="BTCUSDT", bucket_size=10, refresh=2)
 
 
 

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced To-Do List</title>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; }
+        h2 { text-align: center; }
+        .category { margin-bottom: 20px; padding: 10px; border: 1px solid #ddd; }
+        .task { margin: 5px 0; padding: 5px; border: 1px solid #ccc; display: flex; justify-content: space-between; }
+        button { cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>📌 Advanced To-Do List</h2>
+    
+    <input type="text" id="newCategory" placeholder="New Category Name">
+    <button onclick="addCategory()">Add Category</button>
+    
+    <div id="todoContainer"></div>
+    
+    <script>
+        async function loadTodos() {
+            const response = await axios.get('/get_categories');
+            document.getElementById('todoContainer').innerHTML = response.data.map(cat => `
+                <div class="category" id="category-${cat.id}">
+                    <h3>${cat.name} <button onclick="deleteCategory(${cat.id})">❌</button></h3>
+                    <input type="text" id="taskInput-${cat.id}" placeholder="New Task">
+                    <button onclick="addTask(${cat.id})">Add Task</button>
+                    <div id="tasks-${cat.id}">
+                        ${cat.tasks.map(task => `
+                            <div class="task" id="task-${task.id}">
+                                <span>${task.text}</span>
+                                <button onclick="deleteTask(${task.id})">❌</button>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        async function addCategory() {
+            const name = document.getElementById('newCategory').value;
+            if (name) {
+                await axios.post('/add_category', { name });
+                document.getElementById('newCategory').value = '';
+                loadTodos();
+            }
+        }
+        
+        async function deleteCategory(id) {
+            await axios.delete(`/delete_category/${id}`);
+            loadTodos();
+        }
+        
+        async function addTask(categoryId) {
+            const text = document.getElementById(`taskInput-${categoryId}`).value;
+            if (text) {
+                await axios.post('/add_task', { categoryId, text });
+                loadTodos();
+            }
+        }
+        
+        async function deleteTask(id) {
+            await axios.delete(`/delete_task/${id}`);
+            loadTodos();
+        }
+        
+        loadTodos();
+    </script>
+</body>
+</html>

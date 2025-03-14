@@ -15,10 +15,8 @@ import psycopg2.extras
 from utils.logger import setup_logger
 import config.config_db as db_config
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
-
 class PostgresDBBot:
     """Maintains all DB operations for Kline, Order Book, and Trades."""
-
     def __init__(self, log_filename="DB_BOT.log"):
         """Initialize DB connection, create tables if needed, set up logger."""
         # Logger
@@ -84,7 +82,6 @@ class PostgresDBBot:
             self.logger.error(f"Error altering table for indicators: {e}")
         finally:
             cursor.close()
-
     def _create_tables(self):
         """
         Create tables for kline, order book, trades, etc.
@@ -142,7 +139,6 @@ class PostgresDBBot:
             self.logger.error(f"Error creating tables: {e}")
         finally:
             cursor.close()
-
     def store_kline_data(self, symbol, interval, start_time, open_price, close_price,
                          high_price, low_price, volume, turnover, confirmed):
         """
@@ -176,7 +172,6 @@ class PostgresDBBot:
             self.logger.error(f"Error inserting kline: {e}")
         finally:
             cursor.close()
-
     def store_order_book(self, symbol, price, volume, side):
         """
         Insert one order book level into orderbook_data table.
@@ -198,7 +193,6 @@ class PostgresDBBot:
             self.logger.error(f"Error inserting order book data: {e}")
         finally:
             cursor.close()
-
     def store_trade_data(self, symbol, trade_time, price, volume):
         """
         Insert trade data into trade_data table.
@@ -241,6 +235,7 @@ class PostgresDBBot:
                 elif channel == "trade_channel":
                     self.handle_trade_update(data_obj)
                 elif channel == "orderbook_updates":
+                    self.logger.info("ORDER BOOK UPDATES MESSAGE RECEIVED")
                     self.handle_orderbook_update(data_obj)
                 else:
                     self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
@@ -285,7 +280,6 @@ class PostgresDBBot:
             self.update_indicators_for_symbol(symbol, interval)                                  
         except KeyError as e:
             self.logger.error(f"Missing key in kline update: {e}")
-
     def handle_trade_update(self, tdata):
         """
         ✅ Store only large trades in PostgreSQL.
@@ -341,9 +335,6 @@ class PostgresDBBot:
         except KeyError as e:
             self.logger.error(f"🚨 Missing key in trade update: {e}")
             print(f"🚨 ERROR: Missing key {e} in trade data: {tdata}")  # Debugging
-
-
-
     def update_indicators_for_symbol(self, symbol, interval):
         """
         Query all kline_data rows for a given symbol and interval, compute technical
@@ -472,7 +463,6 @@ class PostgresDBBot:
             rsi[i] = 100 - (100 / (1 + rs))
         
         return rsi
-
     def compute_indicators(self,df):
         """
         Given a DataFrame with a 'close' column, compute technical indicators:
@@ -502,7 +492,6 @@ class PostgresDBBot:
         df.drop(columns=['EMA12', 'EMA26', 'STD'], inplace=True)
         
         return df
-
 if __name__ == "__main__":
     # Example usage
     db_bot = PostgresDBBot("DB_BOT.log")

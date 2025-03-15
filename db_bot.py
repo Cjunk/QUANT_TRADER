@@ -14,6 +14,7 @@ from sqlalchemy import create_engine
 import psycopg2.extras
 from utils.logger import setup_logger
 import config.config_db as db_config
+import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
 class PostgresDBBot:
     """Maintains all DB operations for Kline, Order Book, and Trades."""
@@ -25,19 +26,17 @@ class PostgresDBBot:
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
         self.database = db_config.DB_DATABASE
-        self.user = db_config.DB_USER
+        #self.user = db_config.DB_USER
         # ✅ Use SQLAlchemy to create a database engine
         self.db_engine = create_engine(
-            f"postgresql://{self.user}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
+            f"postgresql://{db_config.DB_USER}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
         )
         print("Database Bot (Postgresql) is running .......")
-        # Use DictCursor or NamedTupleCursor if you prefer
-         # ✅ 1️⃣ Keep psycopg2 for your existing queries
         self.conn = psycopg2.connect(
             host=self.host,
             port=self.port,
             database=self.database,
-            user=self.user,
+            user=db_config.DB_USER,
             password=db_config.DB_PASSWORD
         )
         self.conn.autocommit = False  # Or True, if you want auto-commit
@@ -48,18 +47,31 @@ class PostgresDBBot:
         # Now alter the kline_data table to include indicator columns
         self._alter_table_for_indicators()
         # Redis Pub/Sub
-        self.redis_client = redis.Redis(
-            host=ws_config.REDIS_HOST,
-            port=ws_config.REDIS_PORT,
-            db=ws_config.REDIS_DB,
-            decode_responses=True
-        )
+        self.redis_client = self.connect_to_redis()
         self.pubsub = self.redis_client.pubsub()
         # Subscribe to channels (adjust names as needed)
-        self.pubsub.subscribe("kline_updates", "trade_channel", "orderbook_updates")
+        self.pubsub.subscribe(config_redis.KLINE_UPDATES, config_redis.TRADE_CHANNEL, config_redis.ORDER_BOOK_UPDATES)
 
         # Control flag for run loop
         self.running = True
+    def connect_to_redis(self):
+        while True:
+            try:
+                client = redis.Redis(
+                    host=config_redis.REDIS_HOST,
+                    port=config_redis.REDIS_PORT,
+                    db=config_redis.REDIS_DB,
+                    decode_responses=True,
+                    socket_keepalive=True,
+                    retry_on_timeout=True
+                )
+                client.ping()  # Check if Redis is responsive
+                return client
+            except redis.ConnectionError:
+                print("Redis connection failed. Retrying in 5 seconds...")
+                time.sleep(5)
+
+
     def _alter_table_for_indicators(self):
         """Alter kline_data table to add columns for technical indicators if they do not exist."""
         alter_sqls = [
@@ -215,30 +227,36 @@ class PostgresDBBot:
         """Run loop listening to Redis Pub/Sub channels."""
         self.logger.info("DB Bot running, listening to Redis Pub/Sub...")
         while self.running:
-            message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
-            if message:
-                # message['type'] = 'message'
-                # message['channel'] = 'kline_updates' or 'trade_updates'
-                # message['data'] = the actual published string
-                channel = message['channel']
-                data_str = message['data']
+            try:
+                message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                if message:
+                    # message['type'] = 'message'
+                    # message['channel'] = 'kline_updates' or 'trade_updates'
+                    # message['data'] = the actual published string
+                    channel = message['channel']
+                    data_str = message['data']
 
-                # Try parse JSON
-                try:
-                    data_obj = json.loads(data_str)
-                except json.JSONDecodeError:
-                    self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
-                    continue
+                    # Try parse JSON
+                    try:
+                        data_obj = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
+                        continue
 
-                if channel == "kline_updates":
-                    self.handle_kline_update(data_obj)
-                elif channel == "trade_channel":
-                    self.handle_trade_update(data_obj)
-                elif channel == "orderbook_updates":
-                    self.logger.info("ORDER BOOK UPDATES MESSAGE RECEIVED")
-                    self.handle_orderbook_update(data_obj)
-                else:
-                    self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
+                    if channel == config_redis.KLINE_UPDATES:
+                        self.handle_kline_update(data_obj)
+                    elif channel == config_redis.TRADE_CHANNEL:
+                        self.handle_trade_update(data_obj)
+                    elif channel == config_redis.ORDER_BOOK_UPDATES:
+                        #self.logger.info("ORDER BOOK UPDATES MESSAGE RECEIVED")
+                        self.handle_orderbook_update(data_obj)
+                    else:
+                        self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
+            except redis.ConnectionError as e:
+                self.logger.error(f"Redis connection lost: {e}. Reconnecting...")
+                time.sleep(2)  # Wait before retrying
+                self.pubsub = self.redis_client.pubsub()  # Reinitialize Redis Pub/Sub
+                self.pubsub.subscribe(config_redis.KLINE_UPDATES, config_redis.TRADE_CHANNEL, config_redis.ORDER_BOOK_UPDATES)
 
             time.sleep(0.1)
     def handle_kline_update(self, kdata):

@@ -160,78 +160,88 @@ class WebSocketBot:
             #self.last_trade_log_time[symbol] = system_time
 
     def update_order_book(self, symbol, bids, asks):
-            """🔄 Merge incremental order book updates into Redis for a given symbol."""
-            redis_key_bids = f"orderbook:{symbol}:bids"
-            redis_key_asks = f"orderbook:{symbol}:asks"
+        """🔄 Incrementally update order book in Redis without full deletion."""
 
-            # Load existing order book data from Redis
-            existing_bids = {
-                float(price): float(vol)
-                for price, vol in self.redis_client.zrange(redis_key_bids, 0, -1, withscores=True)
-            }
-            existing_asks = {
-                float(price): float(vol)
-                for price, vol in self.redis_client.zrange(redis_key_asks, 0, -1, withscores=True)
-            }
-            #self.logger.debug(f"[{symbol}] Before update: {len(existing_bids)} bids, {len(existing_asks)} asks.")
+        redis_key_bids = f"orderbook:{symbol}:bids"
+        redis_key_asks = f"orderbook:{symbol}:asks"
+        if not bids and not asks:
+            return  # No updates to process
 
-            # Update bids
-            for p, v in bids:
-                price = float(p)
-                volume = float(v)
-                if volume <= 0:
-                    existing_bids.pop(price, None)  # Remove zero volume
-                else:
-                    existing_bids[price] = volume
+        # Fetch only top 20 for efficiency (modify as needed)
+        existing_bids = {
+            float(price): float(vol)
+            for price, vol in self.redis_client.zrevrange(redis_key_bids, 0, 19, withscores=True)
+        }
+        existing_asks = {
+            float(price): float(vol)
+            for price, vol in self.redis_client.zrange(redis_key_asks, 0, 19, withscores=True)
+        }
 
-            # Update asks
-            for p, v in asks:
-                price = float(p)
-                volume = float(v)
-                if volume <= 0:
-                    existing_asks.pop(price, None)
-                else:
-                    existing_asks[price] = volume
+        # Only modify existing bids/asks instead of full delete
+        pipeline = self.redis_client.pipeline()
 
-            #self.logger.debug(f"[{symbol}] After update: {len(existing_bids)} bids, {len(existing_asks)} asks.")
+        for price, volume in bids:
+            price = round(float(price), 8)  # Ensure precision
+            volume = round(float(volume), 8)
+            if volume > 0:
+                pipeline.zadd(redis_key_bids, {str(price): volume})
+            else:
+                pipeline.zrem(redis_key_bids, str(price))  # Remove zero volume bids
+        pipeline.zremrangebyscore(redis_key_asks, "-inf", "inf")  # 🚀 Clear all asks
 
-            # Store updated order book back into Redis
-            self.redis_client.delete(redis_key_bids)
-            self.redis_client.delete(redis_key_asks)
-            if existing_bids:
-                self.redis_client.zadd(redis_key_bids, {str(p): v for p, v in existing_bids.items()})
-            if existing_asks:
-                self.redis_client.zadd(redis_key_asks, {str(p): v for p, v in existing_asks.items()})
+        for price, volume in asks:
+            price = round(float(price), 8)  # Ensure precision
+            volume = round(float(volume), 8)
+            if volume > 0:
+                pipeline.zadd(redis_key_asks, {str(price): volume})
+            else:
+                pipeline.zrem(redis_key_asks, str(price))  # Remove zero volume asks
 
-           
+        if pipeline.command_stack:
+            pipeline.execute()
+            print(f"[DEBUG] ✅ Successfully wrote to Redis for {symbol}")  # 🚀 Ensure pipeline ran
+
+        # Verify the updated state in Redis
+        updated_bids = self.redis_client.zrevrange(redis_key_bids, 0, 9, withscores=True)
+        updated_asks = sorted(
+            self.redis_client.zrange(redis_key_asks, 0, 9, withscores=True),
+            key=lambda x: float(x[0])
+            )
+
+        print(f"\n[DEBUG] Updated Bids in Redis for {symbol}: {updated_bids[:5]}")
+        print(f"[DEBUG] Updated Asks in Redis for {symbol}: {updated_asks[:5]}")
+        
     def _process_order_book(self, data):
         """🔄 Handle incremental order book updates and log debugging info."""
         raw_topic = data.get("topic", "")
         #self.logger.debug(f"Received order book update. Raw topic: {raw_topic}")
         # Expect topic format like "orderbook.200.BTCUSDT" or "orderbook.200.SOLUSDT"
         symbol = raw_topic.split(".")[-1]
-        #self.logger.debug(f"Extracted symbol: {symbol}")
         ob = data.get("data", {})
         if not ob.get("b") or not ob.get("a"):
-            #self.logger.warning(f"No bids or asks found in update for {symbol}: {data}")
+            self.logger.warning(f"No bids or asks found in update for {symbol}: {data}")
             return
 
         # Update Redis order book
-        self.update_order_book(symbol, ob["b"], ob["a"])
-        #self.logger.info(f"[{symbol}] Order book updated.")
+            # 🔍 Debug raw incoming data **before processing**
+        #if symbol == "BTCUSDT":
+            #print(f"\n[DEBUG] Raw Order Book Update for {symbol}: {ob}")
+        #self.update_order_book(symbol, ob["b"], ob["a"])
+        #self.logger.info(f"[{symbol}] Incoming Order Book Update:")
+        #self.logger.info(f"Bids: {ob['b'][:5]} | Asks: {ob['a'][:5]}")
+        self.update_order_book(symbol, sorted(ob["b"], key=lambda x: float(x[0]), reverse=True),
+                                sorted(ob["a"], key=lambda x: float(x[0])))
 
         # Log top levels periodically (every 30 seconds)
-        if time.time() - self.last_trade_log_time.get(symbol, 0) >= 30:
+        if time.time() - self.last_trade_log_time.get(symbol, 0) >= 10:
             redis_key_bids = f"orderbook:{symbol}:bids"
             redis_key_asks = f"orderbook:{symbol}:asks"
             top_bid = self.redis_client.zrange(redis_key_bids, -1, -1, withscores=True)
             top_ask = self.redis_client.zrange(redis_key_asks, 0, 0, withscores=True)
-            #self.logger.info(f"[{symbol}] Top Bid: {top_bid} | Top Ask: {top_ask}")
             self.last_trade_log_time[symbol] = time.time()
 
         # Refresh snapshot every 60 seconds to avoid stale data.
         if (time.time() - self.last_snapshot_time.get(symbol, 0)) > config.REFRESH_ORDER_BOOK_SNAPSHOT_PERIOD:
-            #self.logger.info(f"Refreshing snapshot for {symbol}")
             self.fetch_order_book_snapshot(symbol)
 
 

@@ -32,5 +32,5 @@ if __name__ == "__main__":
             time.sleep(1)  # ✅ Fetch data every X seconds
     except KeyboardInterrupt:
         logger.info("🛑 Stopping WebSocket Bot...")
-        bot.stop()  # ⏹ Stop the bot on Ctrl+C
+        bot._stop()  # ⏹ Stop the bot on Ctrl+C
 

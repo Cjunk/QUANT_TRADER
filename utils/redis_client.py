@@ -9,7 +9,7 @@ def get_latest_trade(symbol):
     """🔍 Fetch the latest trade price from Redis."""
     return redis_client.get(f"latest_trade:{symbol}")
 
-def get_order_book(symbol, depth=20):
+def get_order_book(symbol, depth=200):
     """📡 Fetch the latest order book from Redis (Top N levels)."""
     #redis_client.ping()  # ✅ Ensure connection is alive
 

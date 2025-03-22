@@ -38,6 +38,7 @@ class WebSocketBot:
                         "bot_name": "websocket_bot",
                         "status": "started",
                         "time": datetime.datetime.utcnow().isoformat(),
+                        "auth_token": config.BOT_AUTH_TOKEN,  # each bot has its own
                         "metadata": {
                             "version": "1.2.0",
                             "pid": os.getpid(),

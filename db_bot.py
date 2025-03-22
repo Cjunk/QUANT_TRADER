@@ -21,6 +21,7 @@ import threading
 import datetime
 import redis
 import psycopg2
+import hashlib
 import pandas as pd
 import psycopg2.extras
 import config.config_db as db_config
@@ -198,12 +199,22 @@ class PostgresDBBot:
     =-=-=-=-=-=-=- Database operations
     """  
     def handle_bot_status_update(self,status_obj):
+        cursor = self.conn.cursor()    
+        auth_token = status_obj.get("auth_token")
+        hashed_auth_token = hashlib.sha256(auth_token.encode()).hexdigest()
+
         bot_name = status_obj.get("bot_name")
         status = status_obj.get("status")
         time_str = status_obj.get("time")
-        meta = status_obj.get("metadata", {})
+        meta = status_obj.get("metadata", {})        
+        cursor.execute(f"SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth WHERE bot_name = %s", (bot_name,))
+        row = cursor.fetchone()
+        if not row or row[0] != hashed_auth_token:
+            self.logger.warning(f"Unauthorized bot status attempt from {bot_name}")
+            return  # 🚫 skip further processing       
 
-        cursor = self.conn.cursor()
+
+
 
         # Lookup role_id based on bot_name convention
         role_name = bot_name.split('_')[0]  # e.g., 'websocket_bot' → 'websocket'

@@ -8,9 +8,9 @@ import redis
 import datetime
 import config.config_redis as config_redis
 from utils.logger import setup_logger
-from config.config_bot_template import BOT_NAME, BOT_AUTH_TOKEN
+from config.config_wallet import BOT_NAME, BOT_AUTH_TOKEN
 
-class AuthenticatedBot:
+class WalletService:
     def __init__(self, logger):
         self.bot_name = BOT_NAME
         self.auth_token = BOT_AUTH_TOKEN

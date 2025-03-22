@@ -1,11 +1,8 @@
 import websocket
 import threading
-import json
-import redis
-import time
+import json,time,redis,datetime,os
 import logging
 import requests
-import datetime
 import config.config_ws as config
 import config.config_redis as config_redis
 from utils.logger import setup_logger
@@ -35,17 +32,44 @@ class WebSocketBot:
         self.send_webhook(f"Websocket bot has <@{self.userid}> started .....")
         self.symbols = set()  # Track currently subscribed symbols
         self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(config_redis.COIN_CHANNEL)  # ✅ Listen for coin updates
+        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO)  # ✅ Listen for coin updates
         self.last_sequences = {}
-        print("✅ WebSocket Bot is ready and listening for coin updates...")
+        self.status = {
+                        "bot_name": "websocket_bot",
+                        "status": "started",
+                        "time": datetime.datetime.utcnow().isoformat(),
+                        "metadata": {
+                            "version": "1.2.0",
+                            "pid": os.getpid(),
+                            "strategy": "VWAP"
+                        }
+                    }
     def start(self):
         self._start()
     def stop(self):
         self._stop()
     def _start(self):
-        """🚀 Start WebSocket connections."""
-        self.logger.info(f"✅ WebSocket Bot Started, waiting for coin updates...")
+        """
+        🚀 Launch WebSocket Bot
+        - Registers bot status to Redis for PB tracking
+        - Starts WebSocket listener threads
+        - Waits for coin feed from PB Bot (manual or automatic)
+        """
+        
+        # 🛰️ Notify PB bot that this bot is active
+        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))
+        self.logger.info("✅ Published ACTIVE status to pb_bot (PostgreSQL Manager)")
+        
+        time.sleep(3)
+        # If no coins have been received after X seconds, request resync
+        if not self.symbols:
+            self.logger.warning("⚠️ No coins received after startup — requesting resync...")
+            self.request_coin_list()   
 
+        # 👂 Wait for coin list before starting subscriptions
+        self.logger.info("✅ WebSocket Bot Started — waiting for coin updates...")
+
+        # 🚀 Launch WebSocket connection threads
         for url, subs, name in [
             (config.SPOT_WEBSOCKET_URL, config.SUBSCRIPTIONS["spot"], "Spot")
         ]:
@@ -54,8 +78,12 @@ class WebSocketBot:
                 args=(url, subs, name),
                 daemon=True
             ).start()
+
     def _stop(self):
         """⏹ Stop the WebSocket bot."""
+        self.status['status'] = 'stopped'
+        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))
+        self.logger.info(f"✅ Published STOPPED status to postgresql bot....") 
         self.running = False
         self.send_webhook("Websocket bot has stopped.")        
         self.logger.info("🛑 WebSocket Bot Stopped.")            
@@ -123,6 +151,10 @@ class WebSocketBot:
 
         except json.JSONDecodeError:
             self.logger.error(f"❌ Failed to decode {name} WebSocket message.")
+ 
+    """
+    =-=-=-=-=-=-=- Operations
+    """
     def _listen_for_coin_updates(self, ws):
         """
         Continuously listens to Redis for updated coin lists and updates subscriptions dynamically.
@@ -147,6 +179,19 @@ class WebSocketBot:
 
                 except json.JSONDecodeError:
                     self.logger.error(f"❌ Invalid JSON received: {message['data']}")    
+    def request_coin_list(self):
+        """
+        🆘 Fallback recovery: Ask pb_bot to resend current_coins
+        (In case startup signal was missed or pb_bot crashed)
+        """
+        self.logger.info("📣 Requesting current coin list from pb_bot...")
+        payload = {
+            "bot_name": "websocket_bot",
+            "request": "resend_coin_list"
+        }
+        self.redis_client.publish(config_redis.RESYNC_CHANNEL, json.dumps(payload))
+
+ 
     """
     =-=-=-=-=-=-=- Subscription Managment
     """     
@@ -295,7 +340,7 @@ class WebSocketBot:
             volume = float(volume_str)
             if volume > 0:
                 self.redis_client.zadd(redis_key_bids, {str(price): volume})
-        print(f"\n ============================================= SNAPSHOT UPDATE: {symbol} New bids have now been written to redis bids\n")
+        #print(f"\n ============================================= SNAPSHOT UPDATE: {symbol} New bids have now been written to redis bids\n")
         
         # 3) Write new asks
         for price_str, volume_str in asks:
@@ -514,15 +559,15 @@ class WebSocketBot:
         
         bids = ob.get("b", [])
         asks = ob.get("a", [])
-        self.logger.info(f"HANDLE SNAPSHOT: This is the snapshot BIDS{bids}\n\n")
-        self.logger.info(f"HANDLE SNAPSHOT: This is the snapshot ASKS{asks}\n\n")
+        #self.logger.info(f"HANDLE SNAPSHOT: This is the snapshot BIDS{bids}\n\n")
+        #self.logger.info(f"HANDLE SNAPSHOT: This is the snapshot ASKS{asks}\n\n")
         #print(f"\nBIDS {bids}\n")
         #print(f"\ASKS {asks}\n")
 
-        self._overwrite_entire_order_book(symbol, bids, asks)
-        self.last_snapshot_time[symbol] = time.time()
-        self.last_update_seq[symbol] = update_seq
-        self.logger.info(f"[_HANDLE_SNAPSHOT] Overwrote entire order book for {symbol}, seq={update_seq}")
+        #self._overwrite_entire_order_book(symbol, bids, asks)
+        #self.last_snapshot_time[symbol] = time.time()
+        #self.last_update_seq[symbol] = update_seq
+        #self.logger.info(f"[_HANDLE_SNAPSHOT] Overwrote entire order book for {symbol}, seq={update_seq}")
 
     def _handle_delta(self, symbol, data, update_seq):
         """

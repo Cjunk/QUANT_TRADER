@@ -7,7 +7,7 @@ This bot is the Postgresql bot. Most functions to do with updating postgresql wi
     1.  Subscribe to redis kline channels. And Store the kline data in the kline_data table in Postgresql ✅
     2.  Subs to redis Trade channel. Store filtered Trade data in postgresql. ✅
     3.  Periodically aggregate Order book data and store.
-    4.  Sub to new coin channel. Refresh the current master coin list (Perhaps keep a trailing pre list too)
+    4.  Sub to new coin channel. Refresh the current master coin list (Perhaps keep a trailing pre list too) ✅
     5.  Retrieve Large Trade Thresholds from Postgresql
     6.  Categorise functions
     7.  Externalise variables into config files
@@ -22,30 +22,28 @@ import datetime
 import redis
 import psycopg2
 import pandas as pd
-from sqlalchemy import create_engine
 import psycopg2.extras
-from utils.logger import setup_logger
 import config.config_db as db_config
 import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
-from utils.global_indicators import GlobalIndicators
+from sqlalchemy import create_engine
+from utils.logger import setup_logger
+from utils.global_indicators import GlobalIndicators # central indicators script so all bots and services using the same ones
 class PostgresDBBot:
-    """Maintains all DB operations for Kline, Order Book, and Trades."""
     def __init__(self, log_filename="DB_BOT.log"):
-        """Initialize DB connection, create tables if needed, set up logger."""
         # Logger
         self.logger = setup_logger(log_filename)
-        self.logger.info("Initializing PostgresDBBot...")
+        self.logger.info("Initializing PostgresDBBot...")                
         self.GlobalIndicators = GlobalIndicators()
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
         self.database = db_config.DB_DATABASE
-        #self.user = db_config.DB_USER
         # ✅ Use SQLAlchemy to create a database engine
         self.db_engine = create_engine(
             f"postgresql://{db_config.DB_USER}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
         )
         print("Database Bot (Postgresql) is running .......")
+        self.logger.info("Database Bot (Postgresql) is running .......")
         self.conn = psycopg2.connect(
             host=db_config.DB_HOST,
             port=db_config.DB_PORT,
@@ -112,20 +110,20 @@ class PostgresDBBot:
     def _alter_table_for_indicators(self):
         """Alter kline_data table to add columns for technical indicators if they do not exist."""
         alter_sqls = [
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS rsi NUMERIC(8,4);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd NUMERIC(18,8);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd_signal NUMERIC(18,8);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS macd_hist NUMERIC(18,8);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS ma NUMERIC(18,8);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS upper_band NUMERIC(18,8);",
-            "ALTER TABLE public.kline_data ADD COLUMN IF NOT EXISTS lower_band NUMERIC(18,8);"
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS rsi NUMERIC(8,4);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS macd NUMERIC(18,8);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS macd_signal NUMERIC(18,8);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS macd_hist NUMERIC(18,8);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS ma NUMERIC(18,8);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS upper_band NUMERIC(18,8);",
+            f"ALTER TABLE {db_config.DB_TRADING_SCHEMA}.kline_data ADD COLUMN IF NOT EXISTS lower_band NUMERIC(18,8);"
         ]
         cursor = self.conn.cursor()
         try:
             for sql in alter_sqls:
                 cursor.execute(sql)
             self.conn.commit()
-            self.logger.info("Table 'kline_data' altered successfully for technical indicators.")
+            self.logger.info(f"Table '{db_config.DB_TRADING_SCHEMA}.kline_data' altered successfully for technical indicators.")
         except Exception as e:
             self.conn.rollback()
             self.logger.error(f"Error altering table for indicators: {e}")
@@ -136,8 +134,8 @@ class PostgresDBBot:
         Create tables for kline, order book, trades, etc.
         If you want partitions or advanced schemas, adjust accordingly.
         """
-        create_kline_table = """
-        CREATE TABLE IF NOT EXISTS kline_data (
+        create_kline_table = f"""
+        CREATE TABLE IF NOT EXISTS {db_config.DB_TRADING_SCHEMA}.kline_data (
             id SERIAL PRIMARY KEY,
             symbol VARCHAR(50) NOT NULL,
             interval VARCHAR(10) NOT NULL,
@@ -154,8 +152,8 @@ class PostgresDBBot:
         );
         """
 
-        create_orderbook_table = """
-        CREATE TABLE IF NOT EXISTS orderbook_data (
+        create_orderbook_table = f"""
+        CREATE TABLE IF NOT EXISTS {db_config.DB_TRADING_SCHEMA}.orderbook_data (
             id SERIAL PRIMARY KEY,
             symbol VARCHAR(50) NOT NULL,
             price NUMERIC(18,8) NOT NULL,
@@ -165,8 +163,8 @@ class PostgresDBBot:
         );
         """
 
-        create_trades_table = """
-        CREATE TABLE IF NOT EXISTS trade_data (
+        create_trades_table = f"""
+        CREATE TABLE IF NOT EXISTS {db_config.DB_TRADING_SCHEMA}.trade_data (
             id SERIAL PRIMARY KEY,
             symbol VARCHAR(50) NOT NULL,
             trade_time TIMESTAMP NOT NULL,
@@ -175,8 +173,8 @@ class PostgresDBBot:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
-        create_coins_table = """
-        CREATE TABLE IF NOT EXISTS current_coins (
+        create_coins_table = f"""
+        CREATE TABLE IF NOT EXISTS {db_config.DB_TRADING_SCHEMA}.current_coins (
             id SERIAL PRIMARY KEY,
             symbol VARCHAR(50) NOT NULL,
             timestamp TIMESTAMP NOT NULL,
@@ -190,8 +188,8 @@ class PostgresDBBot:
             --CONSTRAINT fk_bot FOREIGN KEY (bot_id) REFERENCES bots(id)
         );
         """
-        create_previous_coins_table = """
-        CREATE TABLE IF NOT EXISTS current_coins (
+        create_previous_coins_table = f"""
+        CREATE TABLE IF NOT EXISTS {db_config.DB_TRADING_SCHEMA}.current_coins (
             id SERIAL PRIMARY KEY,
             symbol VARCHAR(50) NOT NULL,
             timestamp TIMESTAMP NOT NULL,
@@ -221,6 +219,8 @@ class PostgresDBBot:
             cursor.close()
     def run(self):
         """Run loop listening to Redis Pub/Sub channels."""
+        cursor = self.conn.cursor()
+        cursor.execute(f"SET search_path TO {db_config.DB_TRADING_SCHEMA};")
         self.logger.info("DB Bot running, listening to Redis Pub/Sub...")
         while self.running:
             try:
@@ -276,11 +276,11 @@ class PostgresDBBot:
     def store_kline_data(self, symbol, interval, start_time, open_price, close_price,
                          high_price, low_price, volume, turnover, confirmed):
         """
-        Insert or update a kline row. 
+        Insert or update a trading.kline row. 
         Typically you insert a new row each time a candle closes or to track partial updates.
         """
-        insert_sql = """
-        INSERT INTO kline_data 
+        insert_sql = f"""
+        INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
         (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (symbol, interval, start_time) DO NOTHING
@@ -313,8 +313,8 @@ class PostgresDBBot:
         *A more institutional approach might store entire snapshots in a specialized structure
          or even only store aggregated stats instead of every single level.
         """
-        insert_sql = """
-        INSERT INTO orderbook_data (symbol, price, volume, side)
+        insert_sql = f"""
+        INSERT INTO {db_config.DB_TRADING_SCHEMA}.orderbook_data (symbol, price, volume, side)
         VALUES (%s, %s, %s, %s)
         """
         cursor = self.conn.cursor()
@@ -331,8 +331,8 @@ class PostgresDBBot:
         """
         Insert trade data into trade_data table.
         """
-        insert_sql = """
-        INSERT INTO trade_data (symbol, trade_time, price, volume)
+        insert_sql = f"""
+        INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_data (symbol, trade_time, price, volume)
         VALUES (%s, %s, %s, %s)
         """
         cursor = self.conn.cursor()
@@ -350,7 +350,7 @@ class PostgresDBBot:
         Expect data as such:
         ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
 
-        Inserts each symbol into the current_coins table with the current timestamp.
+        Inserts each symbol into the trading.current_coins table with the current timestamp.
         """
         # Get the current UTC timestamp
         now = datetime.datetime.utcnow()
@@ -360,10 +360,10 @@ class PostgresDBBot:
         
         try:
             cursor = self.conn.cursor()
-            sql = "TRUNCATE TABLE current_coins RESTART IDENTITY;"
+            sql = f"TRUNCATE TABLE {db_config.DB_TRADING_SCHEMA}.current_coins RESTART IDENTITY;"
             cursor.execute(sql)
             #self.conn.commit()              
-            sql = "INSERT INTO current_coins (symbol, timestamp) VALUES (%s, %s);"
+            sql = f"INSERT INTO {db_config.DB_TRADING_SCHEMA}.current_coins (symbol, timestamp) VALUES (%s, %s);"
             # Use a cursor from your database connection
             with self.conn.cursor() as cur:
                 for symbol in symbols:
@@ -385,13 +385,16 @@ class PostgresDBBot:
             with conn:
                 with conn.cursor() as cur:
                     # Option 1: Create a new table with the same data as the source table
-                    cur.execute("DROP TABLE if EXISTS previous_coins;")
-                    cur.execute("CREATE TABLE previous_coins AS SELECT * FROM current_coins;")
+                    cur.execute(f"DROP TABLE if EXISTS {db_config.DB_TRADING_SCHEMA}.previous_coins;")
+                    cur.execute(f"CREATE TABLE {db_config.DB_TRADING_SCHEMA}.previous_coins AS SELECT * FROM current_coins;")
                     # Option 2: If new_table already exists, insert data from old_table into it:
                     # cur.execute("INSERT INTO new_table SELECT * FROM old_table;")
                     self.store_updated_coins_list(cdata['symbols'])  
         finally:
-            print("Done")
+            print("Done")   
+    """
+    =-=-=-=-=-=-=- Data handlers
+    """    
     def handle_kline_update(self, kdata):
         """
         Expects a JSON object with keys like:
@@ -493,7 +496,7 @@ class PostgresDBBot:
         """
         query = """
         SELECT id, start_time, open, close, high, low, volume, turnover
-        FROM kline_data
+        FROM trading.kline_data
         WHERE symbol = %s AND interval = %s
         ORDER BY start_time ASC;
         """
@@ -511,8 +514,8 @@ class PostgresDBBot:
         df = self.GlobalIndicators.compute_indicators(df)
 
         # Now update each row with the computed values
-        update_sql = """
-        UPDATE kline_data
+        update_sql = f"""
+        UPDATE {db_config.DB_TRADING_SCHEMA}.kline_data
         SET rsi = %s,
             macd = %s,
             macd_signal = %s,
@@ -544,12 +547,9 @@ class PostgresDBBot:
             cursor.close()
 
 
-    """
-    =-=-=-=-=-=-=- HELPER FUNCTIONS
-    """ 
-
 if __name__ == "__main__":
     # Example usage
+    open('logs/DB_BOT.log', 'w').close()
     db_bot = PostgresDBBot("DB_BOT.log")
     try:
         db_bot.run()

@@ -62,7 +62,7 @@ class PostgresDBBot:
         self.redis_client = self._connect_to_redis()
         self.pubsub = self.redis_client.pubsub()
         # Subscribe to channels (adjust names as needed)
-        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.KLINE_UPDATES, config_redis.TRADE_CHANNEL, config_redis.ORDER_BOOK_UPDATES)
+        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.KLINE_UPDATES, config_redis.TRADE_CHANNEL, config_redis.RESYNC_CHANNEL,config_redis.ORDER_BOOK_UPDATES,config_redis.SERVICE_STATUS_CHANNEL)
 
         # Control flag for run loop
         self.running = True
@@ -247,6 +247,8 @@ class PostgresDBBot:
                         self.handle_orderbook_update(data_obj)
                     elif channel == config_redis.COIN_CHANNEL:
                         self.handle_coin_list_update(data_obj)
+                    elif channel == config_redis.SERVICE_STATUS_CHANNEL:
+                        self.handle_bot_status_update(data_obj)
                     else:
                         self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
             except redis.ConnectionError as e:
@@ -273,6 +275,64 @@ class PostgresDBBot:
     """
     =-=-=-=-=-=-=- Database operations
     """  
+    def handle_bot_status_update(self,status_obj):
+        bot_name = status_obj.get("bot_name")
+        status = status_obj.get("status")
+        time_str = status_obj.get("time")
+        meta = status_obj.get("metadata", {})
+
+        cursor = self.conn.cursor()
+
+        # Lookup role_id based on bot_name convention
+        role_name = bot_name.split('_')[0]  # e.g., 'websocket_bot' → 'websocket'
+        cursor.execute(f"SELECT id FROM {db_config.DB_TRADING_SCHEMA}.bot_roles WHERE name = %s", (role_name,))
+        role = cursor.fetchone()
+
+        if role:
+            role_id = role[0]
+            cursor.execute(f"""
+                INSERT INTO {db_config.DB_TRADING_SCHEMA}.bots (bot_name, role_id, status, started_at, last_updated, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (bot_name) DO UPDATE
+                SET status = EXCLUDED.status,
+                    last_updated = EXCLUDED.last_updated,
+                    metadata = EXCLUDED.metadata
+            """, (bot_name, role_id, status, time_str, time_str, json.dumps(meta)))
+            self.conn.commit()
+            self.logger.info(f"Bot '{bot_name}' status updated to '{status}'.")
+        else:
+            self.logger.warning(f"No role found for bot_name={bot_name}")
+
+        cursor.close()
+
+        # Special case for websocket
+        if bot_name == "websocket_bot" and status == "started":
+            self._publish_current_coin_list()
+    def _retrieve_coins(self):
+        # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.
+        #   This helps in the case of a power outage or crash, websocket bot can resubscribe to current coins without prompting. 
+        #   This should replace the coin_feeder.py for auto updates when websocket starts. 
+        self.logger.info(f"retrieving current_coins")
+        sql = f"""
+            SELECT symbol FROM {db_config.DB_TRADING_SCHEMA}.current_coins
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql)
+            coins = cursor.fetchall()
+            self.logger.info(f"Retrieved {len(coins)} coin(s) from DB")
+            return coins
+        except Exception as e:
+            self.logger.error(f"Error retrieving coins: {e}")
+            return []
+        finally:
+            cursor.close()
+    def _publish_current_coin_list(self):
+        coins = self._retrieve_coins()
+        current_coin_list = [row[0] for row in coins]
+        payload = json.dumps({"symbols": current_coin_list})
+        self.redis_client.publish(config_redis.COIN_CHANNEL, payload)
+        self.logger.info(f"Published {len(current_coin_list)} coins to COIN_CHANNEL.")
     def store_kline_data(self, symbol, interval, start_time, open_price, close_price,
                          high_price, low_price, volume, turnover, confirmed):
         """

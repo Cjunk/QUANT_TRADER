@@ -6,3 +6,4 @@ fun_trade_bot.py
 *.log
 logs*
 venv/
+Shortcuts

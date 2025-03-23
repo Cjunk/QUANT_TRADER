@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>📊 Bot Dashboard</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #111;
+        color: #f0f0f0;
+        padding: 20px;
+      }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        background: #222;
+        border: 1px solid #444;
+      }
+
+      th,
+      td {
+        padding: 12px 15px;
+        text-align: left;
+        border-bottom: 1px solid #333;
+      }
+
+      th {
+        background: #333;
+      }
+
+      tr:hover {
+        background: #444;
+      }
+
+      .status-started {
+        color: #0f0;
+        font-weight: bold;
+      }
+
+      .status-stopped {
+        color: #f00;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🤖 Quant Trading Platform - Bot Status</h1>
+    <table id="botTable">
+      <thead>
+        <tr>
+          <th>Bot Name</th>
+          <th>Status</th>
+          <th>PID</th>
+          <th>Version</th>
+          <th>Strategy</th>
+          <th>Started At</th>
+          <th>Last Updated</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <script>
+      function fetchBotStatus() {
+        fetch("api/get_bot_status.php?_=" + Date.now()) // 🔥 cache buster
+          .then((res) => res.json())
+          .then((data) => {
+            const tbody = document.querySelector("#botTable tbody");
+            tbody.innerHTML = "";
+
+            if (data.success) {
+              data.bots.forEach((bot) => {
+                const row = document.createElement("tr");
+
+                row.innerHTML = `
+            <td>${bot.bot_name}</td>
+            <td class="status-${bot.status.toLowerCase()}">${bot.status}</td>
+            <td>${bot.pid || "-"}</td>
+            <td>${bot.version || "-"}</td>
+            <td>${bot.strategy || "-"}</td>
+            <td>${bot.started_at}</td>
+            <td>${bot.last_updated}</td>
+          `;
+
+                tbody.appendChild(row);
+              });
+            } else {
+              tbody.innerHTML = `<tr><td colspan="7">Error: ${data.message}</td></tr>`;
+            }
+          })
+          .catch((err) => {
+            const tbody = document.querySelector("#botTable tbody");
+            tbody.innerHTML = `<tr><td colspan="7">Error fetching data</td></tr>`;
+            console.error("Fetch error:", err);
+          });
+      }
+      // 🔁 Initial + interval every 10 seconds
+      fetchBotStatus();
+      setInterval(fetchBotStatus, 10000);
+    </script>
+  </body>
+</html>

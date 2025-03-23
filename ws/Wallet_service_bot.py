@@ -1,4 +1,4 @@
-# 📦 Authenticated Bot Template
+# 📦 Wallet Service Bot 
 # Location: templates/authenticated_bot_template/
 
 import time,os
@@ -22,7 +22,7 @@ class WalletService:
             decode_responses=True
         )
         self.running = True
-        self.heartbeat_interval = 30  # seconds
+        self.heartbeat_interval = 120  # seconds
 
     def register(self):
         payload = {

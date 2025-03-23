@@ -69,7 +69,7 @@ class TradeSupervisor:
             decode_responses=True
         )
         self.running = True
-        self.heartbeat_interval = 30  # seconds
+        self.heartbeat_interval = 120  # seconds
 
     def register(self):
         payload = {

@@ -74,6 +74,7 @@ class PostgresDBBot:
             "SUSDT": 5000,     # ✅ Assuming this is a lower cap coin
             "NEARUSDT": 5000,  # ✅ NEAR large trades ~5000 NEAR
             "ICPUSDT": 3000,   # ✅ ICP large trades ~3000 ICP
+            "ONDOUSDT": 250,
         }
     """
     =-=-=-=-=-=-=- Internal Bot operational functions

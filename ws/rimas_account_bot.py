@@ -8,10 +8,10 @@ import redis
 import datetime
 import config.config_redis as config_redis
 from utils.logger import setup_logger
-from config.{{CONFIG_MODULE}} import BOT_NAME, BOT_AUTH_TOKEN
+from config.config_auto_rimasaccount import BOT_NAME, BOT_AUTH_TOKEN
 
 
-class AuthenticatedBot:
+class RimasAccount:
     def __init__(self, logger):
         self.bot_name = BOT_NAME
         self.auth_token = BOT_AUTH_TOKEN

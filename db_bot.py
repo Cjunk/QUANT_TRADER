@@ -199,49 +199,45 @@ class PostgresDBBot:
     """
     =-=-=-=-=-=-=- Database operations
     """  
-    def handle_bot_status_update(self,status_obj):
-        cursor = self.conn.cursor()    
+    def handle_bot_status_update(self, status_obj):
+        cursor = self.conn.cursor()
         auth_token = status_obj.get("auth_token")
         hashed_auth_token = hashlib.sha256(auth_token.encode()).hexdigest()
 
         bot_name = status_obj.get("bot_name")
         status = status_obj.get("status")
         time_str = status_obj.get("time")
-        meta = status_obj.get("metadata", {})        
-        cursor.execute(f"SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth WHERE bot_name = %s", (bot_name,))
+        meta = status_obj.get("metadata", {})
+
+        # ✅ Verify bot auth
+        cursor.execute(f"""
+            SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth
+            WHERE bot_name = %s
+        """, (bot_name,))
         row = cursor.fetchone()
+
         if not row or row[0] != hashed_auth_token:
-            self.logger.warning(f"Unauthorized bot status attempt from {bot_name}")
-            return  # 🚫 skip further processing       
+            self.logger.warning(f"❌ Unauthorized bot status attempt from {bot_name}")
+            cursor.close()
+            return
 
+        # ✅ Only perform an UPDATE
+        cursor.execute(f"""
+            UPDATE {db_config.DB_TRADING_SCHEMA}.bots
+            SET status = %s,
+                last_updated = %s,
+                metadata = %s
+            WHERE bot_name = %s
+        """, (status, time_str, json.dumps(meta), bot_name))
 
-
-
-        # Lookup role_id based on bot_name convention
-        role_name = bot_name.split('_')[0]  # e.g., 'websocket_bot' → 'websocket'
-        cursor.execute(f"SELECT id FROM {db_config.DB_TRADING_SCHEMA}.bot_roles WHERE name = %s", (role_name,))
-        role = cursor.fetchone()
-
-        if role:
-            role_id = role[0]
-            cursor.execute(f"""
-                INSERT INTO {db_config.DB_TRADING_SCHEMA}.bots (bot_name, role_id, status, started_at, last_updated, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (bot_name) DO UPDATE
-                SET status = EXCLUDED.status,
-                    last_updated = EXCLUDED.last_updated,
-                    metadata = EXCLUDED.metadata
-            """, (bot_name, role_id, status, time_str, time_str, json.dumps(meta)))
-            self.conn.commit()
-            self.logger.info(f"Bot '{bot_name}' status updated to '{status}'.")
-        else:
-            self.logger.warning(f"No role found for bot_name={bot_name}")
-
+        self.conn.commit()
+        self.logger.info(f"✅ Bot '{bot_name}' status updated to '{status}'.")
         cursor.close()
 
-        # Special case for websocket
+        # Optional: handle special bots
         if bot_name == "websocket_bot" and status == "started":
             self._publish_current_coin_list()
+
     def _retrieve_coins(self):
         # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.
         #   This helps in the case of a power outage or crash, websocket bot can resubscribe to current coins without prompting. 

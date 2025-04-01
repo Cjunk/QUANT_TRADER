@@ -201,42 +201,69 @@ class PostgresDBBot:
     """  
     def handle_bot_status_update(self, status_obj):
         cursor = self.conn.cursor()
-        auth_token = status_obj.get("auth_token")
-        hashed_auth_token = hashlib.sha256(auth_token.encode()).hexdigest()
-
         bot_name = status_obj.get("bot_name")
         status = status_obj.get("status")
         time_str = status_obj.get("time")
         meta = status_obj.get("metadata", {})
+        auth_token = status_obj.get("auth_token")
 
-        # ✅ Verify bot auth
+        self.logger.info(f"📨 Received status update for bot: {bot_name}")
+        self.logger.debug(f"Status object: {json.dumps(status_obj, indent=2)}")
+
+        if not all([bot_name, status, time_str, auth_token]):
+            self.logger.error(f"❌ Missing required fields in status_obj: {status_obj}")
+            cursor.close()
+            return
+
+        hashed_auth_token = hashlib.sha256(auth_token.encode()).hexdigest()
+
+        # ✅ Auth Check
         cursor.execute(f"""
             SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth
             WHERE bot_name = %s
         """, (bot_name,))
         row = cursor.fetchone()
 
-        if not row or row[0] != hashed_auth_token:
-            self.logger.warning(f"❌ Unauthorized bot status attempt from {bot_name}")
+        if not row:
+            self.logger.warning(f"❗ No auth record found for bot '{bot_name}'")
             cursor.close()
             return
 
-        # ✅ Only perform an UPDATE
-        cursor.execute(f"""
-            UPDATE {db_config.DB_TRADING_SCHEMA}.bots
-            SET status = %s,
-                last_updated = %s,
-                metadata = %s
-            WHERE bot_name = %s
-        """, (status, time_str, json.dumps(meta), bot_name))
+        if row[0] != hashed_auth_token:
+            self.logger.warning(f"❌ Invalid auth token for bot '{bot_name}'")
+            cursor.close()
+            return
 
-        self.conn.commit()
-        self.logger.info(f"✅ Bot '{bot_name}' status updated to '{status}'.")
+        self.logger.info(f"🔐 Authenticated bot '{bot_name}'")
+
+        # 🔄 Check if bot exists in bots table
+        cursor.execute(f"""
+            SELECT 1 FROM {db_config.DB_TRADING_SCHEMA}.bots
+            WHERE bot_name = %s
+        """, (bot_name,))
+        exists = cursor.fetchone()
+
+        if exists:
+            self.logger.info(f"📝 Updating bot '{bot_name}' status to '{status}' at {time_str}")
+            cursor.execute(f"""
+                UPDATE {db_config.DB_TRADING_SCHEMA}.bots
+                SET status = %s,
+                    last_updated = %s,
+                    metadata = %s
+                WHERE bot_name = %s
+            """, (status, time_str, json.dumps(meta), bot_name))
+            self.conn.commit()
+            self.logger.info(f"✅ Update committed for bot '{bot_name}'")
+        else:
+            self.logger.warning(f"⚠️ Bot '{bot_name}' not found in bots table. Skipping update.")
+
         cursor.close()
 
-        # Optional: handle special bots
+        # Special case for websocket bot
         if bot_name == "websocket_bot" and status == "started":
+            self.logger.info("🌐 WebSocket bot started – publishing current coin list.")
             self._publish_current_coin_list()
+
 
     def _retrieve_coins(self):
         # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.

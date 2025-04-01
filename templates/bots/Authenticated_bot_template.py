@@ -8,7 +8,7 @@ import redis
 import datetime
 import config.config_redis as config_redis
 from utils.logger import setup_logger
-from config.{{CONFIG_MODULE}} import BOT_NAME, BOT_AUTH_TOKEN
+from config.{{CONFIG_MODULE}} import BOT_NAME, BOT_AUTH_TOKEN, HEARTBEAT_INTERVAL
 
 
 class AuthenticatedBot:
@@ -23,7 +23,7 @@ class AuthenticatedBot:
             decode_responses=True
         )
         self.running = True
-        self.heartbeat_interval = 30  # seconds
+        self.heartbeat_interval = HEARTBEAT_INTERVAL  # seconds
 
     def register(self):
         payload = {

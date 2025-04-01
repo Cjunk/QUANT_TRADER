@@ -32,8 +32,6 @@ class WebSocketBot:
         self.send_webhook(f"Websocket bot has <@{self.userid}> started .....")
         self.symbols = set()  # Track currently subscribed symbols
         self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO)  # ✅ Listen for coin updates
-        self.last_sequences = {}
         self.status = {
                         "bot_name": "websocket_bot",
                         "status": "started",
@@ -44,7 +42,11 @@ class WebSocketBot:
                             "pid": os.getpid(),
                             "strategy": "VWAP"
                         }
-                    }
+                    }        
+        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO)  # ✅ Listen for coin updates
+        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))        
+        self.last_sequences = {}   # Track last sequence numbers for each symbol
+
     def start(self):
         self._start()
     def stop(self):
@@ -58,7 +60,7 @@ class WebSocketBot:
         """
         
         # 🛰️ Notify PB bot that this bot is active
-        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))
+
         self.logger.info("✅ Published ACTIVE status to pb_bot (PostgreSQL Manager)")
         
         time.sleep(3)

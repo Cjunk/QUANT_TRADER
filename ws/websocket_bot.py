@@ -28,7 +28,7 @@ class WebSocketBot:
         )
         self.last_snapshot_time = {}
         self.webhook = config.WEBHOOK
-        self.userid = '360612543443501056' # Do not change as its specific for discord
+        self.userid = 'config.WEBSOCKET_USERID # Do not change as its specific for discord
         self.send_webhook(f"Websocket bot has <@{self.userid}> started .....")
         self.symbols = set()  # Track currently subscribed symbols
         self.pubsub = self.redis_client.pubsub()

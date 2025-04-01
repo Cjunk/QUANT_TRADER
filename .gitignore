@@ -8,3 +8,5 @@ logs*
 venv/
 Shortcuts
 SQL/
+mybot.code-workspace*
+.vscode

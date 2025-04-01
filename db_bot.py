@@ -20,6 +20,7 @@ import time
 import threading
 import datetime
 import redis
+import os
 import psycopg2
 import hashlib
 import pandas as pd
@@ -39,6 +40,17 @@ class PostgresDBBot:
         self.GlobalIndicators = GlobalIndicators()
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
+        self.status = {
+                        "bot_name": db_config.BOT_NAME,
+                        "status": "started",
+                        "time": datetime.datetime.utcnow().isoformat(),
+                        "auth_token": db_config.BOT_AUTH_TOKEN,  # each bot has its own
+                        "metadata": {
+                            "version": "1.2.0",
+                            "pid": os.getpid(),
+                            "strategy": "VWAP"
+                        }
+                    }
         self.database = db_config.DB_DATABASE
         # ✅ Use SQLAlchemy to create a database engine
         self.db_engine = create_engine(
@@ -47,13 +59,9 @@ class PostgresDBBot:
         print("Database Bot (Postgresql) is running .......")
         self._setup_postgres()
         self._setup_redis()
-        # Create tables if they do not exist
-        # self._create_tables()
-        # Now alter the kline_data table to include indicator columns
-        # self._alter_table_for_indicators()
         # Control flag for run loop
         self.running = True
-        self.large_trade_thresholds = {
+        self.large_trade_thresholds = { #TODO Transfer to database
             "BTCUSDT": 5,    # ✅ BTC large trades are usually 5+ BTC
             "ETHUSDT": 50,   # ✅ ETH large trades start at ~50 ETH
             "SOLUSDT": 500,  # ✅ SOL is volatile, large trades are ~500 SOL
@@ -76,6 +84,7 @@ class PostgresDBBot:
             "ICPUSDT": 3000,   # ✅ ICP large trades ~3000 ICP
             "ONDOUSDT": 250,
         }
+      
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
     """  
@@ -142,8 +151,10 @@ class PostgresDBBot:
  
 
     def run(self):
+        self.handle_bot_status_update(self.status)
         """Run loop listening to Redis Pub/Sub channels."""
         cursor = self.conn.cursor()
+        
         cursor.execute(f"SET search_path TO {db_config.DB_TRADING_SCHEMA};")
         self.logger.info("DB Bot running, listening to Redis Pub/Sub...")
         while self.running:
@@ -263,7 +274,6 @@ class PostgresDBBot:
         if bot_name == "websocket_bot" and status == "started":
             self.logger.info("🌐 WebSocket bot started – publishing current coin list.")
             self._publish_current_coin_list()
-
 
     def _retrieve_coins(self):
         # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.

@@ -61,33 +61,14 @@ class PostgresDBBot:
         self._setup_redis()
         # Control flag for run loop
         self.running = True
-        self.large_trade_thresholds = { #TODO Transfer to database
-            "BTCUSDT": 5,    # ✅ BTC large trades are usually 5+ BTC
-            "ETHUSDT": 50,   # ✅ ETH large trades start at ~50 ETH
-            "SOLUSDT": 500,  # ✅ SOL is volatile, large trades are ~500 SOL
-            "ADAUSDT": 5000, # ✅ ADA needs ~5000 ADA to be significant
-            "DOTUSDT": 2000, # ✅ DOT large trades are 2000 DOT+
-            "DOGEUSDT": 100000, # ✅ DOGE is high supply, needs 100k+ DOGE
-            "XRPUSDT": 50000, # ✅ XRP whale trades start at 50k+
-            "BNBUSDT": 100,  # ✅ BNB large trades ~100 BNB
-            "LTCUSDT": 500,  # ✅ LTC large trades ~500 LTC
-            "LINKUSDT": 2000, # ✅ LINK large trades ~2000 LINK
-            "TRXUSDT": 100000, # ✅ TRX needs 100k+ to be significant
-            "XLMUSDT": 50000,  # ✅ XLM whale trades ~50k XLM
-            "ATOMUSDT": 1000,  # ✅ ATOM large trades ~1000 ATOM
-            "ALGOUSDT": 100000, # ✅ ALGO needs 100k+
-            "PEPEUSDT": 1000000000, # ✅ Meme coins are extreme
-            "AVAXUSDT": 1000,  # ✅ AVAX large trades ~1000 AVAX
-            "UNIUSDT": 1000,   # ✅ UNI whale trades ~1000 UNI
-            "SUSDT": 5000,     # ✅ Assuming this is a lower cap coin
-            "NEARUSDT": 5000,  # ✅ NEAR large trades ~5000 NEAR
-            "ICPUSDT": 3000,   # ✅ ICP large trades ~3000 ICP
-            "ONDOUSDT": 250,
-        }
+
       
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
     """  
+    # TODO Add function to get all the bots from the table, send an 'are you alive' message to each redis channel per bot
+    # TODO Have a time out for all bots, if no response mark as 'stopped', otherwise 'started'
+
      #   -----POSTGRESQL SETUP
     def _setup_postgres(self):
         self.db_engine = create_engine(
@@ -129,7 +110,8 @@ class PostgresDBBot:
             config_redis.TRADE_CHANNEL,
             config_redis.ORDER_BOOK_UPDATES,
             config_redis.RESYNC_CHANNEL,
-            config_redis.SERVICE_STATUS_CHANNEL
+            config_redis.SERVICE_STATUS_CHANNEL,
+            config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
         )
         self.logger.info("Subscribed to Redis Pub/Sub channels.")
     def _connect_to_redis(self):
@@ -153,6 +135,7 @@ class PostgresDBBot:
     def run(self):
         self.handle_bot_status_update(self.status)
         """Run loop listening to Redis Pub/Sub channels."""
+        self.large_trade_thresholds = self.get_thresholds()
         cursor = self.conn.cursor()
         
         cursor.execute(f"SET search_path TO {db_config.DB_TRADING_SCHEMA};")
@@ -184,6 +167,9 @@ class PostgresDBBot:
                         self.handle_coin_list_update(data_obj)
                     elif channel == config_redis.SERVICE_STATUS_CHANNEL:
                         self.handle_bot_status_update(data_obj)
+                    elif channel == config_redis.REQUEST_COINS:
+                        self.logger.info("Received request for coins list.")
+                        self._publish_current_coin_list()
                     else:
                         self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
             except redis.ConnectionError as e:
@@ -203,6 +189,9 @@ class PostgresDBBot:
     def stop(self):
         """Stop the run loop and close DB connection."""
         self.running = False
+        self.status["status"] = "stopped"
+        self.status["time"] = datetime.datetime.utcnow().isoformat()    
+        self.handle_bot_status_update(self.status)
         self.pubsub.close()
         if self.conn:
             self.conn.close()
@@ -274,7 +263,25 @@ class PostgresDBBot:
         if bot_name == "websocket_bot" and status == "started":
             self.logger.info("🌐 WebSocket bot started – publishing current coin list.")
             self._publish_current_coin_list()
-
+    def get_thresholds(self):
+        """
+        Retrieve large trade thresholds from the database.
+        """
+        sql = f"""
+            SELECT * FROM {db_config.DB_TRADING_SCHEMA}.large_trade_thresholds
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            thresholds = {row[0]: row[1] for row in rows}
+            self.logger.info(f"Retrieved large trade thresholds:")
+            return thresholds
+        except Exception as e:
+            self.logger.error(f"Error retrieving thresholds: {e}")
+            return {}
+        finally:
+            cursor.close()
     def _retrieve_coins(self):
         # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.
         #   This helps in the case of a power outage or crash, websocket bot can resubscribe to current coins without prompting. 

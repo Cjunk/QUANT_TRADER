@@ -33,7 +33,7 @@ class WebSocketBot:
         self.symbols = set()  # Track currently subscribed symbols
         self.pubsub = self.redis_client.pubsub()
         self.status = {
-                        "bot_name": "websocket_bot",
+                        "bot_name": config.BOT_NAME,
                         "status": "started",
                         "time": datetime.datetime.utcnow().isoformat(),
                         "auth_token": config.BOT_AUTH_TOKEN,  # each bot has its own
@@ -43,8 +43,19 @@ class WebSocketBot:
                             "strategy": "VWAP"
                         }
                     }        
-        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO)  # ✅ Listen for coin updates
-        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))        
+        self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO,config.BOT_NAME)  
+        self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))   
+        startup_msg = {
+            "bot": "websocket_bot",
+            "action": "request_coins",
+            "time": "2025-04-02T07:25:25",
+            "metadata": {
+                "version": "1.2.0",
+                "strategy": "VWAP"
+            },
+            "auth_token": config.BOT_AUTH_TOKEN,
+        }
+        self.redis_client.publish(config_redis.REQUEST_COINS,json.dumps(startup_msg)) # This is the message that is sent to the redis server to request the current coins from the pb bot.
         self.last_sequences = {}   # Track last sequence numbers for each symbol
 
     def start(self):

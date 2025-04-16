@@ -9,7 +9,7 @@ LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
-def setup_logger(log_filename, log_level=logging.INFO):
+def setup_logger(log_filename, log_level=logging.DEBUG):
     """Sets up and returns a logger.""" 
     log_path = os.path.join(LOG_DIR, log_filename)
     logger = logging.getLogger(log_filename)

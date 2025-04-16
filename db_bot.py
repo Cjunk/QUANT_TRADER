@@ -8,11 +8,12 @@ This bot is the Postgresql bot. Most functions to do with updating postgresql wi
     2.  Subs to redis Trade channel. Store filtered Trade data in postgresql. ✅
     3.  Periodically aggregate Order book data and store.
     4.  Sub to new coin channel. Refresh the current master coin list (Perhaps keep a trailing pre list too) ✅
-    5.  Retrieve Large Trade Thresholds from Postgresql
+    5.  Retrieve Large Trade Thresholds from Postgresql ✅
     6.  Categorise functions
     7.  Externalise variables into config files
     8.  clean INIT
     9.  Optimise
+    10.  send a redis signal to dedicated channel once kline and indicator data has been stored. signal will include the interval and symbol. 
 """
 
 import json
@@ -20,7 +21,9 @@ import time
 import threading
 import datetime
 import redis
+import numpy as np
 import os
+import sys
 import psycopg2
 import hashlib
 import pandas as pd
@@ -31,7 +34,7 @@ import config.config_ws as ws_config  # If you store Redis host/port here or whe
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
 from utils.global_indicators import GlobalIndicators # central indicators script so all bots and services using the same ones
-
+from psycopg2.extensions import register_adapter, AsIs
 class PostgresDBBot:
     def __init__(self, log_filename="DB_BOT.log"):
         # Logger
@@ -61,7 +64,8 @@ class PostgresDBBot:
         self._setup_redis()
         # Control flag for run loop
         self.running = True
-
+        #register_adapter(np.int64, self.adapt_numpy_int64)
+        #register_adapter(np.float64, self.adapt_numpy_float64)
       
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
@@ -106,9 +110,9 @@ class PostgresDBBot:
         self.pubsub = self.redis_client.pubsub()
         self.pubsub.subscribe(
             config_redis.COIN_CHANNEL,
-            config_redis.KLINE_UPDATES,
-            config_redis.TRADE_CHANNEL,
-            config_redis.ORDER_BOOK_UPDATES,
+            config_redis.PRE_PROC_KLINE_UPDATES,
+            config_redis.PRE_PROC_TRADE_CHANNEL,
+            config_redis.PRE_PROC_ORDER_BOOK_UPDATES,
             config_redis.RESYNC_CHANNEL,
             config_redis.SERVICE_STATUS_CHANNEL,
             config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
@@ -157,11 +161,11 @@ class PostgresDBBot:
                         self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
                         continue
 
-                    if channel == config_redis.KLINE_UPDATES:
+                    if channel == db_config.PRE_PROC_KLINE_UPDATES:
                         self.handle_kline_update(data_obj)
-                    elif channel == config_redis.TRADE_CHANNEL:
+                    elif channel == db_config.PRE_PROC_TRADE_CHANNEL:
                         self.handle_trade_update(data_obj)
-                    elif channel == config_redis.ORDER_BOOK_UPDATES:
+                    elif channel == db_config.PRE_PROC_ORDER_BOOK_UPDATES:
                         self.handle_orderbook_update(data_obj)
                     elif channel == config_redis.COIN_CHANNEL:
                         self.handle_coin_list_update(data_obj)
@@ -319,6 +323,7 @@ class PostgresDBBot:
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (symbol, interval, start_time) DO NOTHING
         """
+
         cursor = self.conn.cursor()
         try:
             cursor.execute(insert_sql, (
@@ -334,6 +339,7 @@ class PostgresDBBot:
                 confirmed
             ))
             self.conn.commit()
+
             #self.logger.info(f"Kline data inserted for {symbol}, interval={interval}, time={start_time}")
         except Exception as e:
             self.conn.rollback()
@@ -455,14 +461,13 @@ class PostgresDBBot:
             volume = float(kdata["volume"])
             turnover = float(kdata["turnover"])
             confirmed = bool(kdata["confirmed"])
-
-            # Convert epoch to python datetime
-            
+         
             #start_dt = datetime.datetime.fromisoformat(kdata["start_time"])
 
             # Store in DB
             self.store_kline_data(symbol, interval, start_dt, open_price, close_price,
                                   high_price, low_price, volume, turnover, confirmed)
+                                  
             # Compute and update technical indicators for this symbol and interval.
             self.update_indicators_for_symbol(symbol, interval)                                  
         except KeyError as e:
@@ -522,20 +527,32 @@ class PostgresDBBot:
 
         except KeyError as e:
             self.logger.error(f"Missing key in orderbook update: {e}") 
+    def adapt_numpy_int64(self,numpy_int64):
+        return AsIs(numpy_int64)
+
+    def adapt_numpy_float64(numpy_float64):
+        return AsIs(numpy_float64)   
+    
     def update_indicators_for_symbol(self, symbol, interval):
         """
         Query all kline_data rows for a given symbol and interval, compute technical
         indicators (RSI, MACD, MA, Bollinger Bands), and update the table rows.
         """
         query = """
-        SELECT id, start_time, open, close, high, low, volume, turnover
+        SELECT id, symbol, start_time, open, close, high, low, volume, turnover
         FROM trading.kline_data
         WHERE symbol = %s AND interval = %s
-        ORDER BY start_time ASC;
+        ORDER BY start_time DESC
+        LIMIT 16;
         """
+
         try:
             df = pd.read_sql(query, self.db_engine, params=(symbol, interval))
+            #self.logger.info(f"Fetched kline data for {symbol} {interval}")
+
         except Exception as e:
+            print("ERROR ")
+            sys.exit()
             self.logger.error(f"Error reading kline data for {symbol} {interval}: {e}")
             return
 
@@ -543,10 +560,16 @@ class PostgresDBBot:
             self.logger.info(f"No kline data to compute indicators for {symbol} {interval}")
             return
 
-        # Compute technical indicators on the DataFrame (assuming compute_indicators is defined)
+        # Compute technical indicators on the DataFrame
+        df.sort_values('start_time', ascending=True, inplace=True)
         df = self.GlobalIndicators.compute_indicators(df)
+       
+        
+        # Get the most recent row (first row after sorting by start_time ASC)
+        
+        most_recent_row = df.iloc[-1].copy()
 
-        # Now update each row with the computed values
+        # Now, update the most recent row with the computed values in the database
         update_sql = f"""
         UPDATE {db_config.DB_TRADING_SCHEMA}.kline_data
         SET rsi = %s,
@@ -560,25 +583,38 @@ class PostgresDBBot:
         """
         cursor = self.conn.cursor()
         try:
-            for index, row in df.iterrows():
-                cursor.execute(update_sql, (
-                    row.get("RSI"),
-                    row.get("MACD"),
-                    row.get("MACD_Signal"),
-                    row.get("MACD_Hist"),
-                    row.get("MA"),
-                    row.get("UpperBand"),
-                    row.get("LowerBand"),
-                    row["id"]
-                ))
+            cursor.execute(update_sql, (
+                    float(most_recent_row['RSI']) if most_recent_row['RSI'] is not None else None,
+                    float(most_recent_row['MACD']) if most_recent_row['MACD'] is not None else None,
+                    float(most_recent_row['MACD_Signal']) if most_recent_row['MACD_Signal'] is not None else None,
+                    float(most_recent_row['MACD_Hist']) if most_recent_row['MACD_Hist'] is not None else None,
+                    float(most_recent_row['MA']) if most_recent_row['MA'] is not None else None,
+                    float(most_recent_row['UpperBand']) if most_recent_row['UpperBand'] is not None else None,
+                    float(most_recent_row['LowerBand']) if most_recent_row['LowerBand'] is not None else None,
+                    int(most_recent_row['id'])  # Important to convert explicitly to int
+            ))
+
+            # Commit the transaction
             self.conn.commit()
-            #self.logger.info(f"Indicators updated for {symbol} {interval}")
+            #print("AUTO STOP TRIGGERED") #TODO DELETE THIS LINE
+            # print(df)   #TODO DELETE THIS LINE
+            #sys.exit() #TODO DELETE THIS LINE
+            #self.logger.info(f"Successfully updated indicators for {symbol} {interval} (ID: {most_recent_row['id']})")
         except Exception as e:
             self.conn.rollback()
             self.logger.error(f"Error updating indicators for {symbol} {interval}: {e}")
         finally:
             cursor.close()
+        # Prepare most recent row for Redis (convert timestamps explicitly)
+        most_recent_row_redis = most_recent_row.to_dict()
 
+        # Convert start_time to ISO string explicitly
+        if isinstance(most_recent_row_redis['start_time'], pd.Timestamp):
+            most_recent_row_redis['start_time'] = most_recent_row_redis['start_time'].isoformat()
+
+        # Push the dictionary to Redis as a JSON string
+        self.redis_client.rpush(db_config.KLINE_QUEUE_CHANNEL, json.dumps(most_recent_row_redis))
+            
 
 if __name__ == "__main__":
     # Example usage

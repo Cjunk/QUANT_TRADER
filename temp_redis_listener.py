@@ -7,13 +7,13 @@ r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 ps = r.pubsub()
 ps.subscribe(
     config_redis.SERVICE_STATUS_CHANNEL,
-    config_redis.HEARTBEAT_CHANNEL,
-    config_redis.COIN_FEED_AUTO,
-    config_redis.COIN_CHANNEL,
-    config_redis.TRADE_CHANNEL,
-    config_redis.ORDER_BOOK_UPDATES,
     config_redis.KLINE_UPDATES,
-    config_redis.REQUEST_COINS
+    config_redis.TRADE_CHANNEL,
+    config_redis.ORDER_BOOK_UPDATES
+    #config_redis.TRADE_CHANNEL,
+    #config_redis.ORDER_BOOK_UPDATES,
+    #config_redis.PRE_PROC_TRADE_CHANNEL
+    #config_redis.KLINE_QUEUE_CHANNEL
 )
 
 print("Listening (Press Ctrl+C to stop)...")

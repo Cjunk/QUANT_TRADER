@@ -12,7 +12,8 @@ import redis
 import datetime
 import config.config_redis as config_redis
 from utils.logger import setup_logger
-from config.config_auto_preprocessor_bot import BOT_NAME, BOT_AUTH_TOKEN, HEARTBEAT_INTERVAL,PRE_PROC_KLINE_UPDATES, PRE_PROC_TRADE_CHANNEL, PRE_PROC_ORDER_BOOK_UPDATES, KLINE_UPDATES, TRADE_CHANNEL, ORDER_BOOK_UPDATES
+from config.config_redis import PRE_PROC_KLINE_UPDATES,PRE_PROC_TRADE_CHANNEL,PRE_PROC_ORDER_BOOK_UPDATES,KLINE_UPDATES,TRADE_CHANNEL,ORDER_BOOK_UPDATES
+from config.config_auto_preprocessor_bot import BOT_NAME, BOT_AUTH_TOKEN, HEARTBEAT_INTERVAL
 
 
 class Preprocessor_bot:
@@ -134,16 +135,13 @@ class Preprocessor_bot:
         elif channel == ORDER_BOOK_UPDATES:
             self._process_orderbook(payload)
     def _process_kline(self, payload):
-        self.logger.info(f"📊 KLINE DATA: ")
         self.redis_client.publish(PRE_PROC_KLINE_UPDATES, json.dumps(payload))
         # Example: Normalize and send to DB or another channel
 
     def _process_trade(self, payload):
-        self.logger.info(f"💰 TRADE DATA: ")
         self.redis_client.publish(PRE_PROC_TRADE_CHANNEL, json.dumps(payload))
         # Example: Check anomalies, publish refined version
 
     def _process_orderbook(self, payload):
-        self.logger.info(f"📘 ORDER BOOK: ")
         self.redis_client.publish(PRE_PROC_ORDER_BOOK_UPDATES, json.dumps(payload))
         # Example: Cache in Redis or stream to analysis bot

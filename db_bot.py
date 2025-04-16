@@ -64,8 +64,6 @@ class PostgresDBBot:
         self._setup_redis()
         # Control flag for run loop
         self.running = True
-        #register_adapter(np.int64, self.adapt_numpy_int64)
-        #register_adapter(np.float64, self.adapt_numpy_float64)
       
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
@@ -161,11 +159,11 @@ class PostgresDBBot:
                         self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
                         continue
 
-                    if channel == db_config.PRE_PROC_KLINE_UPDATES:
+                    if channel == config_redis.PRE_PROC_KLINE_UPDATES:
                         self.handle_kline_update(data_obj)
-                    elif channel == db_config.PRE_PROC_TRADE_CHANNEL:
+                    elif channel == config_redis.PRE_PROC_TRADE_CHANNEL:
                         self.handle_trade_update(data_obj)
-                    elif channel == db_config.PRE_PROC_ORDER_BOOK_UPDATES:
+                    elif channel == config_redis.PRE_PROC_ORDER_BOOK_UPDATES:
                         self.handle_orderbook_update(data_obj)
                     elif channel == config_redis.COIN_CHANNEL:
                         self.handle_coin_list_update(data_obj)
@@ -180,7 +178,15 @@ class PostgresDBBot:
                 self.logger.error(f"Redis connection lost: {e}. Reconnecting...")
                 time.sleep(2)  # Wait before retrying
                 self.pubsub = self.redis_client.pubsub()  # Reinitialize Redis Pub/Sub
-                self.pubsub.subscribe(config_redis.KLINE_UPDATES, config_redis.TRADE_CHANNEL, config_redis.ORDER_BOOK_UPDATES)
+                self.pubsub.subscribe(
+                        config_redis.COIN_CHANNEL,
+                        config_redis.PRE_PROC_KLINE_UPDATES,
+                        config_redis.PRE_PROC_TRADE_CHANNEL,
+                        config_redis.PRE_PROC_ORDER_BOOK_UPDATES,
+                        config_redis.RESYNC_CHANNEL,
+                        config_redis.SERVICE_STATUS_CHANNEL,
+                        config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
+                    )
 
             time.sleep(0.1)   
     def close(self):
@@ -361,7 +367,7 @@ class PostgresDBBot:
         try:
             cursor.execute(insert_sql, (symbol, price, volume, side))
             self.conn.commit()
-            self.logger.debug(f"Order book row inserted {symbol}: {price} / {volume} / {side}")
+            #self.logger.debug(f"Order book row inserted {symbol}: {price} / {volume} / {side}")
         except Exception as e:
             self.conn.rollback()
             self.logger.error(f"Error inserting order book data: {e}")
@@ -596,10 +602,7 @@ class PostgresDBBot:
 
             # Commit the transaction
             self.conn.commit()
-            #print("AUTO STOP TRIGGERED") #TODO DELETE THIS LINE
-            # print(df)   #TODO DELETE THIS LINE
-            #sys.exit() #TODO DELETE THIS LINE
-            #self.logger.info(f"Successfully updated indicators for {symbol} {interval} (ID: {most_recent_row['id']})")
+
         except Exception as e:
             self.conn.rollback()
             self.logger.error(f"Error updating indicators for {symbol} {interval}: {e}")
@@ -613,7 +616,7 @@ class PostgresDBBot:
             most_recent_row_redis['start_time'] = most_recent_row_redis['start_time'].isoformat()
 
         # Push the dictionary to Redis as a JSON string
-        self.redis_client.rpush(db_config.KLINE_QUEUE_CHANNEL, json.dumps(most_recent_row_redis))
+        self.redis_client.rpush(config_redis.KLINE_QUEUE_CHANNEL, json.dumps(most_recent_row_redis))
             
 
 if __name__ == "__main__":

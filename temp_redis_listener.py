@@ -8,8 +8,8 @@ ps = r.pubsub()
 ps.subscribe(
     config_redis.SERVICE_STATUS_CHANNEL,
     config_redis.KLINE_UPDATES,
-    config_redis.TRADE_CHANNEL,
-    config_redis.ORDER_BOOK_UPDATES
+    #config_redis.PRE_PROC_TRADE_CHANNEL,
+    #config_redis.ORDER_BOOK_UPDATES
     #config_redis.TRADE_CHANNEL,
     #config_redis.ORDER_BOOK_UPDATES,
     #config_redis.PRE_PROC_TRADE_CHANNEL

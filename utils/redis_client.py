@@ -1,6 +1,6 @@
 import redis
 import json
-import config.config_ws as config
+import config.config_redis as config
 
 # ✅ Connect to Redis
 redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, db=config.REDIS_DB, decode_responses=True)

@@ -11,11 +11,11 @@ if sys.prefix == sys.base_prefix:
 
 # ✅ Initialize logging
 #logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] - %(message)s")
-logger = setup_logger("main.log")
+#logger = setup_logger("main.log")
 if __name__ == "__main__":
 
-    open(config.LOG_FILENAME, 'w').close()
-    logger.info("🚀 Starting WebSocket Bot...")
+    #open(config.LOG_FILENAME, 'w').close()
+    #logger.info("🚀 Starting WebSocket Bot...")
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}🚀 Starting WebSocket Bot...")
     bot = WebSocketBot()  # ✅ Initialize WebSocket bot
     bot.start()  # 🚀 Start WebSocket connection

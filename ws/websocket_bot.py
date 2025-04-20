@@ -5,25 +5,24 @@ import logging
 import requests
 import config.config_ws as config
 import config.config_redis as config_redis
-from utils.logger import setup_logger
-"""
-#TODOS
-1   When  there is a new coin list detected it should clear the memory of the old coin list sequence numbers other wise it will detect a huge gap if that coin is later subscribed to again.
 
-"""
+from utils.logger import setup_logger
+from config.config_ws import HEARTBEAT_INTERVAL,LOG_FILENAME,LOG_LEVEL
+from config.config_redis import KLINE_UPDATES,TRADE_CHANNEL,ORDER_BOOK_UPDATES
+
 class WebSocketBot:
     """📡 High-Performance WebSocket Bot for Bybit (Quant Trading Ready)."""
     """
     =-=-=-=-=-=-=- System bot functions in the running of the basic bot
     """
     def __init__(self):
-        self.logger = setup_logger(config.LOG_FILENAME)
+        self.logger = setup_logger(LOG_FILENAME,getattr(logging, LOG_LEVEL.upper(), logging.WARNING)) # Set up logger and retrieve the logger type from config file
         self.running = True  # Control flag
         self.last_trade_log_time = {}  # Track last trade log per symbol
         self.redis_client = redis.Redis(
-            host=config.REDIS_HOST,
-            port=config.REDIS_PORT,
-            db=config.REDIS_DB,
+            host=config_redis.REDIS_HOST,
+            port=config_redis.REDIS_PORT,
+            db=config_redis.REDIS_DB,
             decode_responses=True
         )
         self.last_snapshot_time = {}
@@ -42,7 +41,8 @@ class WebSocketBot:
                             "pid": os.getpid(),
                             "strategy": "VWAP"
                         }
-                    }        
+                    }  
+        self._start_self_heartbeat()      
         self.pubsub.subscribe(config_redis.COIN_CHANNEL,config_redis.COIN_FEED_AUTO,config.BOT_NAME)  
         self.redis_client.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))   
         startup_msg = {
@@ -57,7 +57,23 @@ class WebSocketBot:
         }
         self.redis_client.publish(config_redis.REQUEST_COINS,json.dumps(startup_msg)) # This is the message that is sent to the redis server to request the current coins from the pb bot.
         self.last_sequences = {}   # Track last sequence numbers for each symbol
+    def _start_self_heartbeat(self):
+        def self_heartbeat():
+            while self.running:
+                try:
+                    payload = {
+                        "bot_name": config.BOT_NAME,
+                        "heartbeat": True,
+                        "time": datetime.datetime.utcnow().isoformat()
+                    }
+                    self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
+                    self.logger.debug("❤️ WebSocket bot heartbeat sent.")
+                except Exception as e:
+                    self.logger.warning(f"Failed to send heartbeat: {e}")
+                time.sleep(HEARTBEAT_INTERVAL)  # Send every 60 seconds
 
+        threading.Thread(target=self_heartbeat, daemon=True).start()
+    
     def start(self):
         self._start()
     def stop(self):
@@ -161,7 +177,7 @@ class WebSocketBot:
                         "turnover": turnover,
                         "confirmed": True
                     }
-                    self.redis_client.publish("kline_updates", json.dumps(kline_data))
+                    self.redis_client.publish(KLINE_UPDATES, json.dumps(kline_data))
 
         except json.JSONDecodeError:
             self.logger.error(f"❌ Failed to decode {name} WebSocket message.")
@@ -515,7 +531,7 @@ class WebSocketBot:
         )
         self.redis_client.ltrim(f"trades:{symbol}", 0, 999)
         # ✅ Publish trade event for PostgreSQL service bot
-        self.redis_client.publish(f"trade_channel", json.dumps({"symbol": symbol, "trade": data}))
+        self.redis_client.publish(TRADE_CHANNEL, json.dumps({"symbol": symbol, "trade": data}))
 
         # ✅ Log only every 10 seconds per symbol
         if system_time - self.last_trade_log_time.get(symbol, 0) >= config.LOG_TRADE_PRICE_PERIOD:
@@ -622,8 +638,3 @@ class WebSocketBot:
             top_ask = self.redis_client.zrange(redis_key_asks, 0, 0, withscores=True)
             self.last_trade_log_time[symbol] = time.time()
             self.logger.info(f"Top bid for {symbol}: {top_bid}, Top ask for {symbol}: {top_ask}")
-
-
-
-
-

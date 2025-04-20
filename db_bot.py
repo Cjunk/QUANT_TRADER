@@ -24,6 +24,7 @@ import redis
 import numpy as np
 import os
 import sys
+import pytz
 import psycopg2
 import hashlib
 import pandas as pd
@@ -64,7 +65,9 @@ class PostgresDBBot:
         self._setup_redis()
         # Control flag for run loop
         self.running = True
-      
+        self._start_archive_scheduler()
+        self._start_heartbeat_listener()  
+        self._start_self_heartbeat()   
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
     """  
@@ -206,6 +209,32 @@ class PostgresDBBot:
         if self.conn:
             self.conn.close()
         self.logger.info("DB Bot Stopped.")   
+    def _start_archive_scheduler(self):
+        def scheduler():
+            while self.running:
+                now = datetime.datetime.now(pytz.timezone("Australia/Sydney"))
+                target = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+                sleep_duration = (target - now).total_seconds()
+                self.logger.info(f"Next archive scheduled in {sleep_duration / 3600:.2f} hours.")
+                time.sleep(sleep_duration)
+                self._archive_kline_data()
+        threading.Thread(target=scheduler, daemon=True).start()
+    def _start_self_heartbeat(self):
+        def self_heartbeat():
+            while self.running:
+                try:
+                    payload = {
+                        "bot_name": db_config.BOT_NAME,
+                        "heartbeat": True,
+                        "time": datetime.datetime.utcnow().isoformat()
+                    }
+                    self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
+                    self.logger.debug("❤️ Self-heartbeat sent.")
+                except Exception as e:
+                    self.logger.warning(f"Failed to send self-heartbeat: {e}")
+                time.sleep(60)
+
+        threading.Thread(target=self_heartbeat, daemon=True).start()    
     """
     =-=-=-=-=-=-=- Database operations
     """  
@@ -437,25 +466,71 @@ class PostgresDBBot:
                     self.store_updated_coins_list(cdata['symbols'])  
         finally:
             print("Done")   
+    def _update_bot_last_seen(self, bot_name, timestamp):
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"""
+                UPDATE {db_config.DB_TRADING_SCHEMA}.bots
+                SET last_updated = %s
+                WHERE bot_name = %s
+            """, (timestamp, bot_name))
+            self.conn.commit()
+            self.logger.debug(f"✅ Updated last_seen for {bot_name} at {timestamp}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Failed to update last_seen for {bot_name}: {e}")
+        finally:
+            cursor.close()
+    def _start_heartbeat_listener(self):
+        def listen_heartbeat():
+            heartbeat_client = redis.Redis(
+                host=config_redis.REDIS_HOST,
+                port=config_redis.REDIS_PORT,
+                db=config_redis.REDIS_DB,
+                decode_responses=True
+            )
+            pubsub = heartbeat_client.pubsub()
+            pubsub.subscribe(config_redis.HEARTBEAT_CHANNEL)
+
+            while self.running:
+                message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                if message and message["type"] == "message":
+                    try:
+                        payload = json.loads(message["data"])
+                        bot_name = payload.get("bot_name")
+                        timestamp = payload.get("time")
+                        if bot_name and timestamp:
+                            self._update_bot_last_seen(bot_name, timestamp)
+                    except Exception as e:
+                        self.logger.error(f"Failed to handle heartbeat message: {e}")
+                time.sleep(0.5)
+
+        threading.Thread(target=listen_heartbeat, daemon=True).start()   
+    def _archive_kline_data(self):
+        timestamp = datetime.datetime.now(pytz.timezone("Australia/Sydney")).strftime("%d.%m.%Y %H:%M:%S")
+        archive_table = f"kline_data_{timestamp}"
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"CREATE TABLE {archive_table} AS SELECT * FROM {db_config.DB_TRADING_SCHEMA}.kline_data;")
+            cursor.execute(f"""
+                DELETE FROM {db_config.DB_TRADING_SCHEMA}.kline_data 
+                WHERE id NOT IN (
+                    SELECT id FROM {db_config.DB_TRADING_SCHEMA}.kline_data 
+                    ORDER BY start_time DESC LIMIT 50
+                );
+            """)
+            self.conn.commit()
+            self.logger.info(f"✅ Archived kline_data to {archive_table} and preserved last 50 rows.")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Failed to archive kline_data: {e}")
+        finally:
+            cursor.close()   
+
     """
     =-=-=-=-=-=-=- Data handlers
     """    
     def handle_kline_update(self, kdata):
-        """
-        Expects a JSON object with keys like:
-        {
-          "symbol": "BTCUSDT",
-          "interval": "1",
-          "start_time": 1677600000,  # epoch seconds
-          "open": 24000.12,
-          "close": 24001.21,
-          "high": 24100.99,
-          "low": 23950.00,
-          "volume": 123.4567,
-          "turnover": 456789.12,
-          "confirmed": true
-        }
-        """
         try:
             symbol = kdata["symbol"]
             interval = kdata["interval"]
@@ -466,18 +541,35 @@ class PostgresDBBot:
             low_price = float(kdata["low"])
             volume = float(kdata["volume"])
             turnover = float(kdata["turnover"])
-            confirmed = bool(kdata["confirmed"])
-         
-            #start_dt = datetime.datetime.fromisoformat(kdata["start_time"])
+            confirmed = bool(kdata.get("confirmed", True))
 
-            # Store in DB
-            self.store_kline_data(symbol, interval, start_dt, open_price, close_price,
-                                  high_price, low_price, volume, turnover, confirmed)
-                                  
-            # Compute and update technical indicators for this symbol and interval.
-            self.update_indicators_for_symbol(symbol, interval)                                  
-        except KeyError as e:
-            self.logger.error(f"Missing key in kline update: {e}")    
+            # Additional indicators
+            rsi = kdata.get("RSI")
+            macd = kdata.get("MACD")
+            macd_signal = kdata.get("MACD_Signal")
+            macd_hist = kdata.get("MACD_Hist")
+            ma = kdata.get("MA")
+            upper_band = kdata.get("UpperBand")
+            lower_band = kdata.get("LowerBand")
+
+            insert_sql = f"""
+            INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
+            (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed, rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, interval, start_time) DO NOTHING
+            """
+
+            cursor = self.conn.cursor()
+            cursor.execute(insert_sql, (
+                symbol, interval, start_dt, open_price, close_price,
+                high_price, low_price, volume, turnover, confirmed,
+                rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band
+            ))
+            self.conn.commit()
+            cursor.close()
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"Error inserting enriched kline: {e}")   
     def handle_trade_update(self, tdata):
         """
         ✅ Store only large trades in PostgreSQL.

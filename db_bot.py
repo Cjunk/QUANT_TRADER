@@ -27,6 +27,7 @@ import sys
 import pytz
 import psycopg2
 import hashlib
+import logging
 import pandas as pd
 import psycopg2.extras
 import config.config_db as db_config
@@ -34,14 +35,14 @@ import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
-from utils.global_indicators import GlobalIndicators # central indicators script so all bots and services using the same ones
+#from utils.global_indicators import GlobalIndicators # TODO Possible to delete ,central indicators script so all bots and services using the same ones
 from psycopg2.extensions import register_adapter, AsIs
 class PostgresDBBot:
-    def __init__(self, log_filename="DB_BOT.log"):
+    def __init__(self, log_filename=db_config.LOG_FILENAME):
         # Logger
-        self.logger = setup_logger(log_filename)
+        self.logger = setup_logger(db_config.LOG_FILENAME,getattr(logging, db_config.LOG_LEVEL.upper(), logging.WARNING)) # Set up logger and retrieve the logger type from config 
         self.logger.info("Initializing PostgresDBBot...")                
-        self.GlobalIndicators = GlobalIndicators()
+        #self.GlobalIndicators = GlobalIndicators() # TODO possible to delete
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
         self.status = {
@@ -116,6 +117,7 @@ class PostgresDBBot:
             config_redis.PRE_PROC_ORDER_BOOK_UPDATES,
             config_redis.RESYNC_CHANNEL,
             config_redis.SERVICE_STATUS_CHANNEL,
+            config_redis.MACRO_METRICS_CHANNEL,  
             config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
         )
         self.logger.info("Subscribed to Redis Pub/Sub channels.")
@@ -164,6 +166,8 @@ class PostgresDBBot:
 
                     if channel == config_redis.PRE_PROC_KLINE_UPDATES:
                         self.handle_kline_update(data_obj)
+                    elif channel == config_redis.MACRO_METRICS_CHANNEL:
+                        self.handle_macro_metrics(data_obj)
                     elif channel == config_redis.PRE_PROC_TRADE_CHANNEL:
                         self.handle_trade_update(data_obj)
                     elif channel == config_redis.PRE_PROC_ORDER_BOOK_UPDATES:
@@ -551,19 +555,27 @@ class PostgresDBBot:
             ma = kdata.get("MA")
             upper_band = kdata.get("UpperBand")
             lower_band = kdata.get("LowerBand")
-
+            volume_ma = kdata.get("Volume_MA") or kdata.get("volume_ma")
+            volume_change = kdata.get("Volume_Change") or kdata.get("volume_change")
+            volume_slope = kdata.get("Volume_Slope") or kdata.get("volume_slope")
+            rvol = kdata.get("RVOL") or kdata.get("rvol")
+            self.logger.debug(f"Inserting kline: {json.dumps(kdata,indent=2)}")
             insert_sql = f"""
             INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
-            (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed, rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (symbol, interval, start_time) DO NOTHING
+                (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed, 
+                rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band, 
+                volume_ma, volume_change, volume_slope, rvol)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
+                        %s, %s, %s, %s, %s, %s, %s, 
+                        %s, %s, %s, %s)
             """
 
             cursor = self.conn.cursor()
             cursor.execute(insert_sql, (
                 symbol, interval, start_dt, open_price, close_price,
                 high_price, low_price, volume, turnover, confirmed,
-                rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band
+                rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band,
+                volume_ma, volume_change, volume_slope, rvol
             ))
             self.conn.commit()
             cursor.close()
@@ -625,91 +637,42 @@ class PostgresDBBot:
 
         except KeyError as e:
             self.logger.error(f"Missing key in orderbook update: {e}") 
+    def handle_macro_metrics(self, data):
+        try:
+            cursor = self.conn.cursor()
+            insert_sql = """
+            INSERT INTO macro_metrics (
+                timestamp, btc_dominance, eth_dominance, total_market_cap, total_volume,
+                active_cryptos, markets, fear_greed_index, market_sentiment, btc_open_interest, us_inflation
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (timestamp) DO NOTHING;
+            """
+            cursor.execute(insert_sql, (
+                data['timestamp'],
+                data.get('btc_dominance'),
+                data.get('eth_dominance'),
+                data.get('total_market_cap'),
+                data.get('total_volume'),
+                data.get('active_cryptos'),
+                data.get('markets'),
+                data.get('fear_greed_index'),
+                data.get('market_sentiment'),
+                data.get('btc_open_interest'),
+                data.get('us_inflation')
+            ))
+            self.conn.commit()
+            cursor.close()
+            self.logger.info(f"✅ Inserted macro metric @ {data['timestamp']}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Error inserting macro metric: {e}")
+
     def adapt_numpy_int64(self,numpy_int64):
         return AsIs(numpy_int64)
 
     def adapt_numpy_float64(numpy_float64):
         return AsIs(numpy_float64)   
-    
-    def update_indicators_for_symbol(self, symbol, interval):
-        """
-        Query all kline_data rows for a given symbol and interval, compute technical
-        indicators (RSI, MACD, MA, Bollinger Bands), and update the table rows.
-        """
-        query = """
-        SELECT id, symbol, start_time, open, close, high, low, volume, turnover
-        FROM trading.kline_data
-        WHERE symbol = %s AND interval = %s
-        ORDER BY start_time DESC
-        LIMIT 16;
-        """
-
-        try:
-            df = pd.read_sql(query, self.db_engine, params=(symbol, interval))
-            #self.logger.info(f"Fetched kline data for {symbol} {interval}")
-
-        except Exception as e:
-            print("ERROR ")
-            sys.exit()
-            self.logger.error(f"Error reading kline data for {symbol} {interval}: {e}")
-            return
-
-        if df.empty:
-            self.logger.info(f"No kline data to compute indicators for {symbol} {interval}")
-            return
-
-        # Compute technical indicators on the DataFrame
-        df.sort_values('start_time', ascending=True, inplace=True)
-        df = self.GlobalIndicators.compute_indicators(df)
-       
-        
-        # Get the most recent row (first row after sorting by start_time ASC)
-        
-        most_recent_row = df.iloc[-1].copy()
-
-        # Now, update the most recent row with the computed values in the database
-        update_sql = f"""
-        UPDATE {db_config.DB_TRADING_SCHEMA}.kline_data
-        SET rsi = %s,
-            macd = %s,
-            macd_signal = %s,
-            macd_hist = %s,
-            ma = %s,
-            upper_band = %s,
-            lower_band = %s
-        WHERE id = %s;
-        """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(update_sql, (
-                    float(most_recent_row['RSI']) if most_recent_row['RSI'] is not None else None,
-                    float(most_recent_row['MACD']) if most_recent_row['MACD'] is not None else None,
-                    float(most_recent_row['MACD_Signal']) if most_recent_row['MACD_Signal'] is not None else None,
-                    float(most_recent_row['MACD_Hist']) if most_recent_row['MACD_Hist'] is not None else None,
-                    float(most_recent_row['MA']) if most_recent_row['MA'] is not None else None,
-                    float(most_recent_row['UpperBand']) if most_recent_row['UpperBand'] is not None else None,
-                    float(most_recent_row['LowerBand']) if most_recent_row['LowerBand'] is not None else None,
-                    int(most_recent_row['id'])  # Important to convert explicitly to int
-            ))
-
-            # Commit the transaction
-            self.conn.commit()
-
-        except Exception as e:
-            self.conn.rollback()
-            self.logger.error(f"Error updating indicators for {symbol} {interval}: {e}")
-        finally:
-            cursor.close()
-        # Prepare most recent row for Redis (convert timestamps explicitly)
-        most_recent_row_redis = most_recent_row.to_dict()
-
-        # Convert start_time to ISO string explicitly
-        if isinstance(most_recent_row_redis['start_time'], pd.Timestamp):
-            most_recent_row_redis['start_time'] = most_recent_row_redis['start_time'].isoformat()
-
-        # Push the dictionary to Redis as a JSON string
-        self.redis_client.rpush(config_redis.KLINE_QUEUE_CHANNEL, json.dumps(most_recent_row_redis))
-            
+      
 
 if __name__ == "__main__":
     # Example usage

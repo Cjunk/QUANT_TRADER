@@ -85,9 +85,6 @@ CONFIGS = [
     for sl in [0.02, 0.03]
 ]
 
-
-
-
 # === LOAD HISTORICAL DATA ===
 def load_data(symbol, interval, limit):
     try:
@@ -193,6 +190,22 @@ def summary_bar_chart(results):
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+def plot_trades(df, trades):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df['start_time'], df['close'], label='Close Price')
+
+    for trade in trades:
+        time, action, price, *_ = trade
+        color = 'green' if action in ['BUY', 'COVER'] else 'red'
+        marker = '^' if action in ['BUY', 'SHORT'] else 'v'
+        ax.plot(time, price, marker=marker, color=color, label=action)
+
+    ax.set_title('Trade Entries and Exits')
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Price')
+    ax.legend()
+    ax.grid(True)
+    plt.show()
 
 # === MAIN ===
 if __name__ == "__main__":
@@ -204,6 +217,8 @@ if __name__ == "__main__":
             continue
         final_balance, trades = run_backtest(df, config)
         generate_report(config['name'], config['initial_balance'], final_balance, trades)
+        plot_trades(df, trades)
+
         all_results.append({"name": config['name'], "initial": config['initial_balance'], "final": final_balance})
 
     summary_bar_chart(all_results)

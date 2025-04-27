@@ -19,8 +19,11 @@ class GlobalIndicators:
             losses.append(abs(min(change, 0)))
         avg_gain = sum(gains) / period
         avg_loss = sum(losses) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-        rsi[period] = 100 - (100 / (1 + rs))
+        if avg_loss == 0:
+            rsi[period] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[period] = round(100 - (100 / (1 + rs)), 6)
 
         for i in range(period + 1, len(prices)):
             change = prices[i] - prices[i - 1]
@@ -28,8 +31,11 @@ class GlobalIndicators:
             loss = abs(min(change, 0))
             avg_gain = (avg_gain * (period - 1) + gain) / period
             avg_loss = (avg_loss * (period - 1) + loss) / period
-            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-            rsi[i] = 100 - (100 / (1 + rs))
+            if avg_loss == 0:
+                rsi[i] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi[i] = round(100 - (100 / (1 + rs)), 6)
 
         return rsi
 

@@ -25,6 +25,8 @@ import logging
 import pytz  # For timezone handling
 from collections import deque
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if os.name == 'nt':
+    sys.stdout.reconfigure(encoding='utf-8')
 # Config & Setup
 from config.config_redis import (
     REDIS_HOST, REDIS_PORT, REDIS_DB,
@@ -43,6 +45,7 @@ class PreprocessorBot:
         self.running = True
         self.GlobalIndicators = GlobalIndicators()
         self.kline_windows = {}  # {(symbol, interval): deque}
+        self.trade_windows={}
         
     def _connect_redis(self):
         #self.redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
@@ -75,19 +78,31 @@ class PreprocessorBot:
             except Exception as e:
                 self.logger.warning(f"⚠️ Heartbeat failed: {e}")
             time.sleep(HEARTBEAT_INTERVAL)
-
-    def run(self):
-        self.logger.info("🚀 Preprocessor Bot is running...")
-        self._connect_redis()
-        self._register()
+    def _start_background_tasks(self):
         threading.Thread(target=self._heartbeat, daemon=True).start()
         threading.Thread(target=self._listen_redis, daemon=True).start()
+        threading.Thread(target=self._flush_old_trades, daemon=True).start()
+    def run(self):
+        self.logger.info(" Preprocessor Bot is running...")
+        self._connect_redis()
+        self._register()
+        self._start_background_tasks()
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
+            self._final_flush()
             self._stop()
-
+    def _flush_old_trades(self):
+        while self.running:
+            try:
+                current_minute = pd.Timestamp.utcnow().floor('min')
+                expired_keys = [k for k in self.trade_windows if k[1] < current_minute]
+                for key in expired_keys:
+                    self._publish_trade_summary(key, self.trade_windows.pop(key))
+            except Exception as e:
+                self.logger.error(f"\u274c Error flushing old trades: {e}")
+            time.sleep(1)
     def _stop(self):
         self.running = False
         payload = {
@@ -153,8 +168,47 @@ class PreprocessorBot:
         except Exception as e:
             self.logger.error(f"❌ Error processing kline indicators: {e}")
 
-    def _process_trade(self, payload): #TODO: Add trade processing logic
-        self.redis_client.publish(PRE_PROC_TRADE_CHANNEL, json.dumps(payload))
+    def _publish_trade_summary(self, key, trades):
+        symbol, minute_start = key
+        total_volume = sum(t["volume"] for t in trades)
+        vwap = (sum(t["price"] * t["volume"] for t in trades) / total_volume) if total_volume > 0 else 0
+        trade_count = len(trades)
+        max_trade = max(trades, key=lambda t: t["volume"], default={"volume": 0, "price": 0})
+
+        summary = {
+            "symbol": symbol,
+            "minute_start": minute_start.isoformat(),
+            "total_volume": total_volume,
+            "vwap": vwap,
+            "trade_count": trade_count,
+            "largest_trade_volume": max_trade["volume"],
+            "largest_trade_price": max_trade["price"]
+        }
+        self.redis_client.publish(PRE_PROC_TRADE_CHANNEL, json.dumps(summary))
+        #self.logger.debug(f" Published summarized trade data: {summary}")
+
+    def _process_trade(self, payload):
+        try:
+            symbol = payload["symbol"]
+            trade_time = pd.to_datetime(payload["trade_time"], utc=True).floor('min')
+            price = payload["price"]
+            volume = payload["volume"]
+
+            key = (symbol, trade_time)
+
+            if key not in self.trade_windows:
+                self.trade_windows[key] = []
+
+            self.trade_windows[key].append({"price": price, "volume": volume})
+
+        except Exception as e:
+            self.logger.error(f"\u274c Error processing trade: {e}")
+
+    def _final_flush(self):
+        self.logger.info("\ud83d\udd04 Flushing all remaining trade windows at shutdown...")
+        for key, trades in list(self.trade_windows.items()):
+            self._publish_trade_summary(key, trades)
+        self.trade_windows.clear()
 
     def _process_orderbook(self, payload):#TODO: Add order book processing logic
         self.redis_client.publish(PRE_PROC_ORDER_BOOK_UPDATES, json.dumps(payload))

@@ -1,7 +1,7 @@
 import sys
 import time
 from utils.logger import setup_logger
-from ws.macro_metrics_services_bot import Macro_metrics_services
+from macro_metrics_services_bot import Macro_metrics_services
 import config.config_auto_macro_metrics_services as config
 
 if sys.prefix == sys.base_prefix:

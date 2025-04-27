@@ -37,6 +37,8 @@ from sqlalchemy import create_engine
 from utils.logger import setup_logger
 #from utils.global_indicators import GlobalIndicators # TODO Possible to delete ,central indicators script so all bots and services using the same ones
 from psycopg2.extensions import register_adapter, AsIs
+if os.name == 'nt':
+    sys.stdout.reconfigure(encoding='utf-8')
 INTERVAL_MAP = {"1": 1, "5": 5, "60": 60, "D": 1440}
 class PostgresDBBot:
     
@@ -47,7 +49,7 @@ class PostgresDBBot:
         #self.GlobalIndicators = GlobalIndicators() # TODO possible to delete
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
-        
+        self.trade_buffer = []
         self.status = {
                         "bot_name": db_config.BOT_NAME,
                         "status": "started",
@@ -67,18 +69,15 @@ class PostgresDBBot:
         )
         print("Database Bot (Postgresql) is running .......")
         self._setup_postgres()
-        #self._initial_gap_fix()  # This is a ONE time run function only. mostly no need to uncomment. it was used to fill database gaps. 24/04/2025
         self._setup_redis()
         # Control flag for run loop
         self.running = True
-        #self.backfill_recent_history()   # Only run once to clean database table 
-        #sys.exit()
         self._start_archive_scheduler()
         self._start_heartbeat_listener()  
-        self._start_self_heartbeat() 
-                   
+        threading.Thread(target=self._flush_trade_buffer, daemon=True).start()
+        self._start_self_heartbeat()      
         self._start_gap_check()
-        
+        self.subscribed_channels = set()  # ✅ Track active websocket topics
 
     def backfill_recent_history(self, symbol="BTCUSDT", days=2):  # PATCHED
         """
@@ -107,8 +106,6 @@ class PostgresDBBot:
             else:
                 self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
                 self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
-            
-
   
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
@@ -208,19 +205,14 @@ class PostgresDBBot:
             try:
                 message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
                 if message:
-                    # message['type'] = 'message'
-                    # message['channel'] = 'kline_updates' or 'trade_updates'
-                    # message['data'] = the actual published string
                     channel = message['channel']
                     data_str = message['data']
-
                     # Try parse JSON
                     try:
                         data_obj = json.loads(data_str)
                     except json.JSONDecodeError:
                         self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
                         continue
-
                     if channel == config_redis.PRE_PROC_KLINE_UPDATES:
                         self.handle_kline_update(data_obj)
                     elif channel == config_redis.MACRO_METRICS_CHANNEL:
@@ -293,7 +285,7 @@ class PostgresDBBot:
                         "time": datetime.datetime.utcnow().isoformat()
                     }
                     self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
-                    self.logger.debug("❤️ Self-heartbeat sent.")
+                    self.logger.debug("Self-heartbeat sent.")
                 except Exception as e:
                     self.logger.warning(f"Failed to send self-heartbeat: {e}")
                 time.sleep(60)
@@ -466,24 +458,7 @@ class PostgresDBBot:
             self.logger.error(f"Error inserting order book data: {e}")
         finally:
             cursor.close()
-    def store_trade_data(self, symbol, trade_time, price, volume):
-        """
-        Insert trade data into trade_data table.
-        """
-        insert_sql = f"""
-        INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_data (symbol, trade_time, price, volume)
-        VALUES (%s, %s, %s, %s)
-        """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(insert_sql, (symbol, trade_time, price, volume))
-            self.conn.commit()
-            self.logger.debug(f"Trade inserted for {symbol} @ {price}")
-        except Exception as e:
-            self.conn.rollback()
-            self.logger.error(f"Error inserting trade data: {e}")
-        finally:
-            cursor.close()
+
     def store_updated_coins_list(self, symbols):
         """
         Expect data as such:
@@ -621,7 +596,7 @@ class PostgresDBBot:
             volume_change = kdata.get("Volume_Change") or kdata.get("volume_change")
             volume_slope = kdata.get("Volume_Slope") or kdata.get("volume_slope")
             rvol = kdata.get("RVOL") or kdata.get("rvol")
-            self.logger.debug(f"Inserting kline: {json.dumps(kdata,indent=2)}")
+            #self.logger.debug(f"Inserting kline: {json.dumps(kdata,indent=2)}")
             insert_sql = f"""
             INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
                 (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed, 
@@ -663,35 +638,83 @@ class PostgresDBBot:
             self.conn.rollback()
             self.logger.error(f"Error inserting enriched kline: {e}")   
     def handle_trade_update(self, tdata):
-        """
-        ✅ Store only large trades in PostgreSQL.
-        """
         try:
-            # ✅ Extract the actual trade information
-            if "trade" in tdata and "data" in tdata["trade"] and len(tdata["trade"]["data"]) > 0:
-                trade_info = tdata["trade"]["data"][0]  # ✅ Get the latest trade
-            else:
-                print(f"🚨 ERROR: Invalid trade format: {tdata}")  # Debugging
-                return  # 🚨 Skip this trade
-
             symbol = tdata["symbol"]
-            trade_time = trade_info["T"]  
-            price = float(trade_info["p"])  
-            volume = float(trade_info["v"])  
+            minute_start = pd.to_datetime(tdata["minute_start"], utc=True)
+            total_volume = float(tdata["total_volume"])
+            vwap = float(tdata["vwap"])
+            trade_count = int(tdata["trade_count"])
+            largest_trade_volume = float(tdata["largest_trade_volume"])
+            largest_trade_price = float(tdata["largest_trade_price"])
 
-            trade_dt = datetime.datetime.utcfromtimestamp(trade_time / 1000)  
+            self.trade_buffer.append((
+                symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price
+            ))
+        except Exception as e:
+            self.logger.error(f"🚨 Error buffering summarized trade data: {e}")
 
-            # ✅ Set a threshold per coin (Modify as needed)
-            threshold = self.large_trade_thresholds.get(symbol, 10)  # Default threshold = 10
 
-            # ✅ Only store large trades
-            if volume >= threshold:
-                #print(f"✅ Storing large trade in DB: {symbol} | {volume} units @ {price}")  # Debugging
-                self.store_trade_data(symbol, trade_dt, price, volume)
+    def store_trade_summary(self, symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price):
+        insert_sql = f"""
+            INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_summary_data
+            (symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, minute_start) DO UPDATE
+            SET
+                total_volume = EXCLUDED.total_volume,
+                vwap = EXCLUDED.vwap,
+                trade_count = EXCLUDED.trade_count,
+                largest_trade_volume = EXCLUDED.largest_trade_volume,
+                largest_trade_price = EXCLUDED.largest_trade_price
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(insert_sql, (
+                symbol,
+                minute_start,
+                total_volume,
+                vwap,
+                trade_count,
+                largest_trade_volume,
+                largest_trade_price
+            ))
+            self.conn.commit()
+            self.logger.debug(f"✅ Trade summary inserted/updated for {symbol} @ {minute_start}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Error inserting trade summary: {e}")
+        finally:
+            cursor.close()
+    def _flush_trade_buffer(self):
+        while self.running:
+            if self.trade_buffer:
+                try:
+                    cursor = self.conn.cursor()
+                    insert_sql = f"""
+                    INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_summary_data
+                    (symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, minute_start) DO UPDATE
+                    SET
+                        total_volume = EXCLUDED.total_volume,
+                        vwap = EXCLUDED.vwap,
+                        trade_count = EXCLUDED.trade_count,
+                        largest_trade_volume = EXCLUDED.largest_trade_volume,
+                        largest_trade_price = EXCLUDED.largest_trade_price
+                    """
+                    cursor.executemany(insert_sql, self.trade_buffer)
+                    self.conn.commit()
+                    inserted = cursor.rowcount
+                    self.logger.info(f" Bulk inserted {inserted} summarized trades into DB")
+                    self.trade_buffer.clear()
+                except Exception as e:
+                    self.conn.rollback()
+                    self.logger.error(f" Error during bulk insert of trades: {e}")
+                finally:
+                    cursor.close()
+            time.sleep(5)  # Adjust if needed
 
-        except KeyError as e:
-            self.logger.error(f"🚨 Missing key in trade update: {e}")
-            print(f"🚨 ERROR: Missing key {e} in trade data: {tdata}")  # Debugging    
+
     def handle_orderbook_update(self, odata):
         """
         Expects something like:
@@ -891,7 +914,7 @@ class PostgresDBBot:
                 try:
                     pd.to_datetime(int(k[0]), unit='ms', utc=True)  # debug placeholder
                 except Exception as e:
-                    self.logger.error(f"❌ Time conversion failed for {k[0]}: {e}")
+                    self.logger.error(f" Time conversion failed for {k[0]}: {e}")
                     continue
 
                 values.append((

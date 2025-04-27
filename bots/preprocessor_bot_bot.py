@@ -133,6 +133,13 @@ class PreprocessorBot:
                 self.kline_windows[key].append(json.loads(item))
 
         # Add and persist the new kline
+        # 🔄 Deduplication check
+        if self.kline_windows[key]:
+            last = self.kline_windows[key][-1]
+            if last["start_time"] == payload["start_time"] and last["close"] == payload["close"]:
+                self.logger.debug("🔁 Duplicate kline detected, skipping republish.")
+                return
+
         self.kline_windows[key].append(payload)
         self.redis_client.rpush(redis_key, json.dumps(payload))
         self.redis_client.ltrim(redis_key, -WINDOW_SIZE, -1)

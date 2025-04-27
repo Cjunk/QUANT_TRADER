@@ -37,9 +37,9 @@ STRATEGIES = {
          row['volume'] > row['volume_ma'] * params.get("volume_multiplier", 1.5))
     ),
     "macd_cross_rsi": lambda row, params, short=False: (
-        (row['macd_hist'] > 0 and row['rsi'] > params.get("rsi_trigger", 50))
+        (row['macd_hist'] > 0 and row['rsi'] > params.get("rsi_trigger", 49))
         if not short else
-        (row['macd_hist'] < 0 and row['rsi'] < params.get("rsi_trigger", 50))
+        (row['macd_hist'] < 0 and row['rsi'] < params.get("rsi_trigger", 51))
     ),
     "bbands_cross": lambda row, params, short=False: (
         (row['close'] < row['lower_band']) if not short else (row['close'] > row['upper_band'])
@@ -65,24 +65,24 @@ CONFIGS = [
         "name": f"{strategy.upper()}_L{lev}_SL{int(sl * 100)}",
         "symbol": "BTCUSDT",
         "interval": "1",
-        "klines": 2000,
+        "klines": 100,
         "initial_balance": 1000,
         "leverage": lev,
         "stop_loss": sl,
         "trailing_stop": 0.2,
         "strategy": strategy,
         "strategy_params": {
-            "rsi_buy": 30,
-            "rsi_sell": 70,
-            "macd_hist_threshold": 0.0,
+            "rsi_buy": 25,
+            "rsi_sell": 75,
+            "macd_hist_threshold": 1.0,
             "volume_multiplier": 1.5,
             "rsi_trigger": 50,
-            "rsi_exit": 70
+            "rsi_exit": 75
         }
     }
     for strategy in STRATEGIES.keys()
-    for lev in [2, 3]
-    for sl in [0.02, 0.03]
+    for lev in [2, 10]
+    for sl in [0.07, 0.07]
 ]
 
 # === LOAD HISTORICAL DATA ===
@@ -96,17 +96,21 @@ def load_data(symbol, interval, limit):
             password=db_config.DB_PASSWORD
         )
         query = f"""
-        SELECT start_time, open, close, high, low, volume,
-               rsi, macd, macd_signal, macd_hist, ma,
-               upper_band, lower_band
-        FROM {db_config.DB_TRADING_SCHEMA}.kline_data
-        WHERE symbol = %s AND interval = %s
-        ORDER BY start_time ASC
-        LIMIT %s;
+            WITH recent_data AS (
+                SELECT start_time, open, close, high, low, volume,
+                    rsi, macd, macd_signal, macd_hist, ma,
+                    upper_band, lower_band
+                FROM {db_config.DB_TRADING_SCHEMA}.kline_data
+                WHERE symbol = %s AND interval = %s
+                ORDER BY start_time DESC
+                LIMIT %s
+            )
+            SELECT * FROM recent_data ORDER BY start_time ASC;
         """
         df = pd.read_sql(query, conn, params=(symbol, interval, limit))
         df['start_time'] = pd.to_datetime(df['start_time'])
-        df['volume_ma'] = df['volume'].rolling(10).mean()
+        df['volume_ma'] = df['volume'].rolling(15).mean()
+
         return df.dropna()
     except Exception as e:
         print(f"DB Load Error: {e}")

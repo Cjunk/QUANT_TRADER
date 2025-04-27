@@ -1,9 +1,9 @@
-import sys
-import time
-from utils.redis_client import get_latest_trade, get_order_book
-from ws.websocket_bot import WebSocketBot
-from utils.logger import setup_logger
-import config.config_ws as config
+#import sys
+#import time
+#from utils.redis_client import get_latest_trade, get_order_book
+#from ws.websocket_bot import WebSocketBot
+#from utils.logger import setup_logger
+#import config.config_ws as config
 # ✅ Ensure script runs in venv
 if sys.prefix == sys.base_prefix:
     print("❌ Virtual environment is NOT activated! Please activate it first.")

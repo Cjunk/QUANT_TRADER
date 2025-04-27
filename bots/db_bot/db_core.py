@@ -37,7 +37,9 @@ from sqlalchemy import create_engine
 from utils.logger import setup_logger
 #from utils.global_indicators import GlobalIndicators # TODO Possible to delete ,central indicators script so all bots and services using the same ones
 from psycopg2.extensions import register_adapter, AsIs
+INTERVAL_MAP = {"1": 1, "5": 5, "60": 60, "D": 1440}
 class PostgresDBBot:
+    
     def __init__(self, log_filename=db_config.LOG_FILENAME):
         # Logger
         self.logger = setup_logger(db_config.LOG_FILENAME,getattr(logging, db_config.LOG_LEVEL.upper(), logging.WARNING)) # Set up logger and retrieve the logger type from config 
@@ -45,6 +47,7 @@ class PostgresDBBot:
         #self.GlobalIndicators = GlobalIndicators() # TODO possible to delete
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
+        
         self.status = {
                         "bot_name": db_config.BOT_NAME,
                         "status": "started",
@@ -56,6 +59,7 @@ class PostgresDBBot:
                             "strategy": "VWAP"
                         }
                     }
+
         self.database = db_config.DB_DATABASE
         # ✅ Use SQLAlchemy to create a database engine
         self.db_engine = create_engine(
@@ -63,18 +67,71 @@ class PostgresDBBot:
         )
         print("Database Bot (Postgresql) is running .......")
         self._setup_postgres()
+        #self._initial_gap_fix()  # This is a ONE time run function only. mostly no need to uncomment. it was used to fill database gaps. 24/04/2025
         self._setup_redis()
         # Control flag for run loop
         self.running = True
+        #self.backfill_recent_history()   # Only run once to clean database table 
+        #sys.exit()
         self._start_archive_scheduler()
         self._start_heartbeat_listener()  
-        self._start_self_heartbeat()   
+        self._start_self_heartbeat() 
+                   
+        self._start_gap_check()
+        
+
+    def backfill_recent_history(self, symbol="BTCUSDT", days=2):  # PATCHED
+        """
+        One-time script to repopulate fresh kline history for recent N days.
+        Pulls for all configured intervals.
+        """
+        import datetime
+        self.logger.info(f"🚀 Starting backfill of {symbol} for past {days} days")
+        end = pd.Timestamp.utcnow().replace(tzinfo=None)
+
+        for interval, minutes in INTERVAL_MAP.items():
+            # Allow longer historical range for high intervals
+            if interval == "60":
+                start = end - pd.Timedelta(days=30)
+            elif interval == "D":
+                start = end - pd.Timedelta(days=180)
+            else:
+                start = end - pd.Timedelta(days=days)
+
+            self.logger.info(f"🔄 Backfilling {symbol}-{interval} from {start} to {end}")
+            klines = self._fetch_bybit_klines(symbol, interval, minutes, start, end, category='spot')
+            if klines:
+                self.logger.info(f"📈 Fetched {len(klines)} klines: from {klines[0][0]} to {klines[-1][0]}")
+                self._insert_missing_klines(symbol, interval, klines)
+                self.logger.info(f"✅ Inserted {len(klines)} klines for {symbol}-{interval}")
+            else:
+                self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
+                self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
+            
+
+  
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
     """  
     # TODO Add function to get all the bots from the table, send an 'are you alive' message to each redis channel per bot
     # TODO Have a time out for all bots, if no response mark as 'stopped', otherwise 'started'
-
+    def _initial_gap_fix(self):
+        symbols = [row[0] for row in self._retrieve_coins()]
+        intervals = ["1", "5", "60", "D"]  # Adjust as needed
+        for symbol in symbols:
+            for interval in intervals:
+                self._fix_data_gaps(symbol, interval)
+    def _start_gap_check(self):
+        def periodic_gap_check():
+            while self.running:
+                symbols = [row[0] for row in self._retrieve_coins()]
+                intervals = ["1", "5", "15", "60","D"]  # Customize intervals as needed
+                for symbol in symbols:
+                    for interval in intervals:
+                        self._fix_data_gaps(symbol, interval)
+                self.logger.info("Completed gap checks for all symbols/intervals. Next check in 6 hours.")
+                time.sleep(21600)  # Check every 6 hours
+        threading.Thread(target=periodic_gap_check, daemon=True).start()
      #   -----POSTGRESQL SETUP
     def _setup_postgres(self):
         self.db_engine = create_engine(
@@ -178,6 +235,9 @@ class PostgresDBBot:
                         self.handle_bot_status_update(data_obj)
                     elif channel == config_redis.REQUEST_COINS:
                         self.logger.info("Received request for coins list.")
+                        self._publish_current_coin_list()
+                    elif channel == config_redis.RESYNC_CHANNEL:
+                        self.logger.info("Received resync signal, publishing coin list.")
                         self._publish_current_coin_list()
                     else:
                         self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
@@ -463,8 +523,9 @@ class PostgresDBBot:
             with conn:
                 with conn.cursor() as cur:
                     # Option 1: Create a new table with the same data as the source table
-                    cur.execute(f"DROP TABLE if EXISTS {db_config.DB_TRADING_SCHEMA}.previous_coins;")
-                    cur.execute(f"CREATE TABLE {db_config.DB_TRADING_SCHEMA}.previous_coins AS SELECT * FROM current_coins;")
+                    cur.execute(f"TRUNCATE {db_config.DB_TRADING_SCHEMA}.previous_coins;")
+                    cur.execute(f"INSERT INTO {db_config.DB_TRADING_SCHEMA}.previous_coins SELECT * FROM {db_config.DB_TRADING_SCHEMA}.current_coins;")
+
                     # Option 2: If new_table already exists, insert data from old_table into it:
                     # cur.execute("INSERT INTO new_table SELECT * FROM old_table;")
                     self.store_updated_coins_list(cdata['symbols'])  
@@ -538,7 +599,8 @@ class PostgresDBBot:
         try:
             symbol = kdata["symbol"]
             interval = kdata["interval"]
-            start_dt = datetime.datetime.fromisoformat(kdata["start_time"])
+            start_dt = pd.to_datetime(kdata["start_time"]).tz_localize('UTC') if pd.to_datetime(kdata["start_time"]).tzinfo is None else pd.to_datetime(kdata["start_time"]).tz_convert('UTC')
+
             open_price = float(kdata["open"])
             close_price = float(kdata["close"])
             high_price = float(kdata["high"])
@@ -567,7 +629,25 @@ class PostgresDBBot:
                 volume_ma, volume_change, volume_slope, rvol)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
                         %s, %s, %s, %s, %s, %s, %s, 
-                        %s, %s, %s, %s)
+                        %s, %s, %s, %s) 
+                        ON CONFLICT (symbol, interval, start_time) DO UPDATE SET
+                            close = EXCLUDED.close,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            volume = EXCLUDED.volume,
+                            turnover = EXCLUDED.turnover,
+                            confirmed = EXCLUDED.confirmed,
+                            rsi = EXCLUDED.rsi,
+                            macd = EXCLUDED.macd,
+                            macd_signal = EXCLUDED.macd_signal,
+                            macd_hist = EXCLUDED.macd_hist,
+                            ma = EXCLUDED.ma,
+                            upper_band = EXCLUDED.upper_band,
+                            lower_band = EXCLUDED.lower_band,
+                            volume_ma = EXCLUDED.volume_ma,
+                            volume_change = EXCLUDED.volume_change,
+                            volume_slope = EXCLUDED.volume_slope,
+                            rvol = EXCLUDED.rvol
             """
 
             cursor = self.conn.cursor()
@@ -673,6 +753,171 @@ class PostgresDBBot:
     def adapt_numpy_float64(numpy_float64):
         return AsIs(numpy_float64)   
       
+    def _fix_data_gaps(self, symbol, interval, lookback=5000):
+        cursor = self.conn.cursor()
+        try:
+            self.logger.info(f"Checking gaps in {symbol}-{interval}")
+            interval_minutes = INTERVAL_MAP.get(interval)
+            if interval_minutes is None:
+                self.logger.error(f"Unsupported interval: {interval}")
+                return
+
+            sql = f"""
+                SELECT start_time FROM {db_config.DB_TRADING_SCHEMA}.kline_data
+                WHERE symbol = %s AND interval = %s
+                ORDER BY start_time ASC
+            """
+            df = pd.read_sql(sql, self.db_engine, params=(symbol, interval))
+
+            if df.empty:
+                self.logger.warning(f"No data in DB for {symbol}-{interval}, skipping gap check.")
+                return
+
+            df['start_time'] = pd.to_datetime(df['start_time'], utc=True)
+            df.set_index('start_time', inplace=True)
+            df.index = df.index.floor(f"{interval_minutes}min")
+
+            now_utc = pd.Timestamp.now(tz='UTC').floor(f"{interval_minutes}min") - pd.Timedelta(minutes=interval_minutes)
+
+            expected_times = pd.date_range(start=df.index.min(), end=now_utc, freq=f'{interval_minutes}min')
+            existing_times = set(df.index)
+            missing_times = [t for t in expected_times if t not in existing_times]
+
+            self.logger.debug(f"First 3 timestamps in DB: {df.index[:3]}")
+            self.logger.debug(f"First 3 missing: {missing_times[:3]}")
+
+            if not missing_times:
+                self.logger.info(f"No gaps for {symbol}-{interval}")
+                return
+
+            gap_groups = pd.Series(missing_times).groupby(
+                (pd.Series(missing_times).diff() != pd.Timedelta(minutes=interval_minutes)).cumsum()
+            )
+
+            for _, gap in gap_groups:
+                start_gap = gap.min()
+                end_gap = gap.max()
+                self.logger.info(f"Gap detected: {start_gap} to {end_gap} ({symbol}-{interval})")
+                klines = self._fetch_bybit_klines(symbol, interval, interval_minutes, start_gap, end_gap + pd.Timedelta(minutes=interval_minutes), category='spot')
+                expected = int(((end_gap + pd.Timedelta(minutes=interval_minutes)) - start_gap).total_seconds() // 60 // interval_minutes)
+                if len(klines) > expected:
+                    self.logger.warning(f"Bybit returned {len(klines)} candles for a range that should have only {expected} — slicing to expected")
+                    klines = klines[:expected]
+                if klines:
+                    self._insert_missing_klines(symbol, interval, klines)
+                    self.logger.info(f"Inserted {len(klines)} missing klines for gap {start_gap} - {end_gap}")
+                else:
+                    self.logger.warning(f"No klines returned for gap {start_gap} - {end_gap}")
+
+        except Exception as e:
+            self.logger.error(f"Gap-fix error: {e}")
+
+        try:
+            last_time = df.index.max()
+            now = pd.Timestamp.now(tz='UTC').floor(f"{interval_minutes}min")
+
+            self.logger.warning(f"📊 DB trailing check → Last: {last_time}, Now UTC: {now}")
+            if now > last_time + pd.Timedelta(minutes=interval_minutes):
+                self.logger.info(f"Trailing gap detected from {last_time + pd.Timedelta(minutes=interval_minutes)} to {now} ({symbol}-{interval})")
+                self.logger.info(f"⏱️ Gap duration: {(now - last_time).total_seconds() / 60:.1f} minutes")
+                klines = self._fetch_bybit_klines(
+                    symbol,
+                    interval,
+                    interval_minutes,
+                    last_time + pd.Timedelta(minutes=interval_minutes),
+                    now,
+                    category='spot'
+                )
+                if klines:
+                    self._insert_missing_klines(symbol, interval, klines)
+                    self.logger.info(f"Inserted {len(klines)} trailing klines for {symbol}-{interval}")
+                else:
+                    self.logger.warning(f"No trailing klines returned for {symbol}-{interval}")
+        except Exception as e:
+            self.logger.error(f"Trailing gap check failed: {e}")
+
+        finally:
+            cursor.close()
+
+
+    def _fetch_bybit_klines(self, symbol, interval, interval_minutes, start_time, end_time, category='spot'):
+        import requests
+        klines = []
+        start_ts = int(start_time.timestamp() * 1000)  # RESTORED TO UTC-BASED DYNAMIC TIME
+        end_ts = int(end_time.timestamp() * 1000)  # RESTORED TO UTC-BASED DYNAMIC TIME
+
+        while start_ts <= end_ts:
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'start': start_ts,
+                'limit': 1000,
+                'category': category
+            }
+            self.logger.debug(f"🛰️ Fetching Bybit SPOT klines for {symbol}-{interval} from {start_time} to {end_time} (UTC)")
+
+            resp = requests.get("https://api.bybit.com/v5/market/kline", params=params).json()
+
+            if resp['retCode'] != 0 or not resp['result']['list']:
+                self.logger.warning(f"No API data returned: {resp}")
+                break
+
+            batch = list(reversed(resp['result']['list']))
+            klines.extend(batch)
+            self.logger.debug(f"🧾 First ts: {batch[0][0]}, Last ts: {batch[-1][0]}")
+
+            last_ts = int(batch[-1][0])
+
+            if last_ts <= start_ts:
+                break
+
+            start_ts = last_ts + interval_minutes * 60000  # Advance correctly to next candle
+            time.sleep(0.2)  # Respect API rate limits
+
+        return klines
+
+    def _insert_missing_klines(self, symbol, interval, klines):
+        cursor = self.conn.cursor()
+        insert_sql = f"""
+            INSERT INTO trading.kline_data 
+            (symbol, interval, start_time, open, high, low, close, volume, turnover, confirmed)
+            VALUES (%s, %s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s, %s, TRUE)
+            ON CONFLICT (symbol, interval, start_time) DO NOTHING
+        """
+        try:
+            values = []
+            for k in klines:
+                self.logger.debug(f"📦 Raw Kline: {k}")
+                try:
+                    pd.to_datetime(int(k[0]), unit='ms', utc=True)  # debug placeholder
+                except Exception as e:
+                    self.logger.error(f"❌ Time conversion failed for {k[0]}: {e}")
+                    continue
+
+                values.append((
+                    symbol,
+                    interval,
+                    int(k[0]),
+                    float(k[1]),
+                    float(k[2]),
+                    float(k[3]),
+                    float(k[4]),
+                    float(k[5]),
+                    float(k[6])
+                ))
+
+            cursor.executemany(insert_sql, values)
+            inserted = cursor.rowcount
+            self.conn.commit()
+            self.logger.info(f"✅ Actually inserted {inserted} klines for {symbol}-{interval}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"Inserting klines failed: {e}")
+        finally:
+            cursor.close()
+
+
+
 
 if __name__ == "__main__":
     # Example usage

@@ -1,10 +1,28 @@
+"""
+    High Performance Websocket Bot for Byebit Exchange
+    This bot is designed to handle high-frequency trading data and publish it to Redis.
+    It subscribes to multiple channels and processes messages in real-time.     
+
+    It also handles reconnections and resubscriptions automatically.
+    The bot is designed to be run as a standalone script and can be easily integrated into other systems.   
+
+    WORK FLOW 27/04/2025:
+    1. subscribe to redis channels COIN_CHANNEL, COIN_FEED_AUTO, BOT_NAME
+
+    Written by: Jericho Sharman
+
+"""
+
+
 import sys, time, os
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))   # Synch folder path
 sys.path.insert(0, project_root)
 if os.name == 'nt':
-    sys.stdout.reconfigure(encoding='utf-8')
-import websocket
-import threading
+    sys.stdout.reconfigure(encoding='utf-8')  # CLI encoding for Windows
+
+# Import necessary libraries
+import websocket,threading
+
 import json, time, redis, datetime, os, requests
 import logging
 from websocket_bot.utils import (
@@ -28,6 +46,7 @@ class WebSocketBot:
         self.symbols = set()
         self.pubsub = self.redis_client.pubsub()
         self.pubsub.subscribe(config_redis.COIN_CHANNEL, config_redis.COIN_FEED_AUTO, config.BOT_NAME)
+
         self.last_trade_log_time = {}
         self.last_snapshot_time = {}
         self.last_sequences = {}

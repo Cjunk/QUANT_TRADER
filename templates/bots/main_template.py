@@ -8,10 +8,7 @@ if sys.prefix == sys.base_prefix:
     print("❌ Virtual environment is NOT activated! Please activate it first.")
     sys.exit(1)
 
-logger = setup_logger("{{LOGGER_NAME}}.log")
-
 if __name__ == "__main__":
-    open(config.LOG_FILENAME, 'w').close()
     logger.info("🚀 Starting {{LOGGER_NAME}}...")
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 🚀 Starting {{LOGGER_NAME}}...")
 

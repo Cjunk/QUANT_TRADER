@@ -7,8 +7,8 @@ if __name__ == "__main__":
         print("❌ Virtual environment is not activated. Please activate it first.")
         sys.exit(1)
 
-    open('logs/DB_BOT.log', 'w').close()
-    bot = PreprocessorBot("preprocessor_BOT.log")
+    #open('logs/DB_BOT.log', 'w').close()
+    bot = PreprocessorBot()
     try:
         bot.run()
     except KeyboardInterrupt:

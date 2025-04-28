@@ -16,7 +16,7 @@ from config.config_auto_preprocessor_bot import (
 )
 
 class PreprocessorBot:
-    def __init__(self, log_filename="PREPROCESSOR_BOT.log"):
+    def __init__(self, log_filename=LOG_FILENAME):
         self.logger = setup_logger(LOG_FILENAME, getattr(logging, LOG_LEVEL.upper(), logging.WARNING))
         self.bot_name = BOT_NAME
         self.auth_token = BOT_AUTH_TOKEN

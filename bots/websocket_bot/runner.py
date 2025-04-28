@@ -1,6 +1,6 @@
 import sys, time, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from websocket_bot.ws_core import WebSocketBot
+from ws_core import WebSocketBot
 
 if __name__ == "__main__":
     if sys.prefix == sys.base_prefix:

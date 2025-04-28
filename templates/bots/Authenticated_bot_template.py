@@ -36,13 +36,7 @@ class AuthenticatedBot:
             "metadata": {
                 "version": "1.0",
                 "pid": os.getpid(),
-                "role": "TEMPLATE",
-                "metadata": {  # Its here where bot specific metadata can be added
-                    "Heartbeat": HEARTBEAT_INTERVAL,
-                    "LOG_LEVEL": LOG_LEVEL,
-                    "value 3": "                    
-            }
-            
+                "role": "TEMPLATE"      
         }}
         self.redis.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(payload))
         self.logger.info(f"🔐 Registered bot '{BOT_NAME}' with status 'started'.")

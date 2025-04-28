@@ -38,7 +38,7 @@ class TriggerBot:
         self.pubsub = None
         self.db_conn = None
         self.windows = {}  # {(symbol, interval): deque}
-        self.WINDOW_SIZE = 5
+        self.WINDOW_SIZE = 14
 
     def connect_postgres(self):
         try:
@@ -95,6 +95,51 @@ class TriggerBot:
         except Exception as e:
             self.logger.error(f"❌ Preloading klines failed: {e}")
             sys.exit(1)
+    def _refresh_symbols_periodically(self):
+        while self.running:
+            try:
+                time.sleep(1800)  # 30 minutes
+                cursor = self.db_conn.cursor()
+                cursor.execute("SET search_path TO trading;")
+                cursor.execute("SELECT symbol FROM current_coins;")
+                new_symbols = [row[0] for row in cursor.fetchall()]
+                cursor.close()
+
+                current_symbols = {key[0] for key in self.windows.keys()}
+
+                for symbol in new_symbols:
+                    if symbol not in current_symbols:
+                        for interval in ["1", "5", "60", "D"]:
+                            cursor = self.db_conn.cursor()
+                            cursor.execute(f"""
+                                SELECT symbol, interval, start_time, close, rsi, macd, volume, volume_ma
+                                FROM kline_data
+                                WHERE symbol = %s AND interval = %s
+                                ORDER BY start_time DESC
+                                LIMIT {self.WINDOW_SIZE}
+                            """, (symbol, interval))
+
+                            rows = cursor.fetchall()
+                            if rows:
+                                rows.reverse()
+                                self.windows[(symbol, interval)] = [
+                                    {
+                                        "symbol": r[0],
+                                        "interval": r[1],
+                                        "start_time": r[2],
+                                        "close": r[3],
+                                        "RSI": r[4],
+                                        "MACD": r[5],
+                                        "volume": r[6],
+                                        "Volume_MA": r[7]
+                                    }
+                                    for r in rows
+                                ]
+                                self.logger.info(f"✅ Dynamically loaded {len(rows)} candles for {symbol}-{interval}")
+                            cursor.close()
+
+            except Exception as e:
+                self.logger.error(f"❌ Error refreshing symbols: {e}")
 
     def connect_redis(self):
         self.redis_client = redis.Redis(
@@ -143,31 +188,68 @@ class TriggerBot:
             df["close"] = pd.to_numeric(df["close"], errors='coerce')
             df["RSI"] = pd.to_numeric(df["RSI"], errors='coerce')
             df["MACD"] = pd.to_numeric(df["MACD"], errors='coerce')
+            df["MACD_Signal"] = pd.to_numeric(df["MACD_Signal"], errors='coerce')
             df["Volume_MA"] = pd.to_numeric(df["Volume_MA"], errors='coerce')
             df["volume"] = pd.to_numeric(df["volume"], errors='coerce')
+            df["UpperBand"] = pd.to_numeric(df["UpperBand"], errors='coerce')
+            df["LowerBand"] = pd.to_numeric(df["LowerBand"], errors='coerce')
+
+            if df.isnull().any().any():
+                self.logger.warning(f"⚠️ Skipping trend analysis for {symbol}-{interval} due to missing values.")
+                return
+
+            close = df["close"].iloc[-1]
+            volume = df["volume"].iloc[-1]
+            volume_ma = df["Volume_MA"].iloc[-1]
+            macd_now = df["MACD"].iloc[-1]
+            macd_signal_now = df["MACD_Signal"].iloc[-1]
+            rvol = volume / (volume_ma + 1e-8)
 
             price_slope = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0]
-            rsi_slope = (df["RSI"].iloc[-1] - df["RSI"].iloc[0]) / df["RSI"].iloc[0]
-            macd_slope = (df["MACD"].iloc[-1] - df["MACD"].iloc[0]) / abs(df["MACD"].iloc[0]) if df["MACD"].iloc[0] != 0 else 0
-            volume_ratio = df["volume"].iloc[-1] / df["Volume_MA"].iloc[-1]
+            rsi_slope = (df["RSI"].iloc[-1] - df["RSI"].iloc[0]) / 100
+            macd_slope = (df["MACD"].iloc[-1] - df["MACD"].iloc[0]) / (abs(df["MACD"].iloc[0]) + 1e-8)
 
-            trend_score = 0
-            if price_slope > 0.002: trend_score += 1
-            if rsi_slope > 0.01: trend_score += 1
-            if macd_slope > 0.01: trend_score += 1
-            if volume_ratio > 1.2: trend_score += 1
+            price_score = min(max(price_slope, -0.05), 0.05) / 0.05
+            rsi_score = min(max(rsi_slope, -0.5), 0.5) / 0.5
+            macd_score = min(max(macd_slope, -1), 1)
+            rvol_score = min(rvol / 3, 1)
 
-            if trend_score >= 2:
+            confidence = (price_score * 0.4 + rsi_score * 0.25 + macd_score * 0.2 + rvol_score * 0.15) * 100
+
+            window_info = f"{df['start_time'].iloc[0]} ➔ {df['start_time'].iloc[-1]}"
+
+            # 🔥 Trend Trigger
+            if confidence >= 50:
                 direction = "📈 UP" if price_slope > 0 else "📉 DOWN"
-                self.logger.info(f"\n⚡ Trigger detected!\n"
-                                 f"Symbol: {symbol}\n"
-                                 f"Interval: {interval}\n"
-                                 f"Trend: {direction}\n"
-                                 f"Price Δ: {price_slope:.2%}\n"
-                                 f"RSI Δ: {rsi_slope:.2%}\n"
-                                 f"MACD Δ: {macd_slope:.2%}\n"
-                                 f"Volume/MA: {volume_ratio:.2f}x\n"
-                                 f"Window: {df['start_time'].iloc[0]} ➔ {df['start_time'].iloc[-1]}")
+                self.logger.info(f"\n⚡ Trend Trigger\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"Trend: {direction}\nConfidence: {confidence:.2f}%\n"
+                                f"Price Δ: {price_slope:.2%} | RSI Δ: {rsi_slope:.2%} | MACD Δ: {macd_slope:.2%}\n"
+                                f"RVOL: {rvol:.2f}x\nWindow: {window_info}")
+
+            # 🔥 MACD Crossover
+            macd_prev = df["MACD"].iloc[-2]
+            macd_signal_prev = df["MACD_Signal"].iloc[-2]
+            if macd_prev < macd_signal_prev and macd_now > macd_signal_now:
+                self.logger.info(f"\n🚀 MACD Bullish Crossover\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"MACD now above Signal\nWindow: {window_info}")
+            elif macd_prev > macd_signal_prev and macd_now < macd_signal_now:
+                self.logger.info(f"\n⚠️ MACD Bearish Crossover\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"MACD now below Signal\nWindow: {window_info}")
+
+            # 🔥 Breakout Detection
+            upper_band = df["UpperBand"].iloc[-1]
+            lower_band = df["LowerBand"].iloc[-1]
+            if close > upper_band:
+                self.logger.info(f"\n🚀 Breakout Above Upper Band\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"Close={close:.2f} > UpperBand={upper_band:.2f}\nWindow: {window_info}")
+            elif close < lower_band:
+                self.logger.info(f"\n⚠️ Breakdown Below Lower Band\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"Close={close:.2f} < LowerBand={lower_band:.2f}\nWindow: {window_info}")
+
+            # 🔥 Volume Spike
+            if rvol > 2.5:
+                self.logger.info(f"\n📈 Volume Spike Detected\nSymbol: {symbol} | Interval: {interval}\n"
+                                f"RVOL: {rvol:.2f}x vs Normal\nWindow: {window_info}")
 
         except Exception as e:
             self.logger.error(f"❌ Trend analysis failed: {e}")
@@ -178,7 +260,7 @@ class TriggerBot:
         self.preload_recent_klines()
         self.connect_redis()
         self._start_background()
-
+        threading.Thread(target=self._refresh_symbols_periodically, daemon=True).start()
         try:
             while self.running:
                 time.sleep(1)

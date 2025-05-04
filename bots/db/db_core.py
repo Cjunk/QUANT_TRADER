@@ -33,6 +33,7 @@ import psycopg2.extras
 import config.config_db as db_config
 import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
+from wallet_balance import store_wallet_balances
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
 #from utils.global_indicators import GlobalIndicators # TODO Possible to delete ,central indicators script so all bots and services using the same ones
@@ -122,7 +123,7 @@ class PostgresDBBot:
         def periodic_gap_check():
             while self.running:
                 symbols = [row[0] for row in self._retrieve_coins()]
-                intervals = ["1", "5", "15", "60","D"]  # Customize intervals as needed
+                intervals = ["1", "5",  "60","D"]  # Customize intervals as needed
                 for symbol in symbols:
                     for interval in intervals:
                         self._fix_data_gaps(symbol, interval)
@@ -547,7 +548,8 @@ class PostgresDBBot:
 
         threading.Thread(target=listen_heartbeat, daemon=True).start()   
     def _archive_kline_data(self):
-        timestamp = datetime.datetime.now(pytz.timezone("Australia/Sydney")).strftime("%d.%m.%Y %H:%M:%S")
+        timestamp = datetime.datetime.now(pytz.timezone("Australia/Sydney")).strftime("%Y%m%d_%H%M%S")
+
         archive_table = f"kline_data_{timestamp}"
         cursor = self.conn.cursor()
         try:
@@ -705,7 +707,7 @@ class PostgresDBBot:
                     cursor.executemany(insert_sql, self.trade_buffer)
                     self.conn.commit()
                     inserted = cursor.rowcount
-                    self.logger.info(f" Bulk inserted {inserted} summarized trades into DB")
+                    #self.logger.info(f" Bulk inserted {inserted} summarized trades into DB")
                     self.trade_buffer.clear()
                 except Exception as e:
                     self.conn.rollback()

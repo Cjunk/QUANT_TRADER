@@ -236,7 +236,7 @@ class WebSocketBot:
             self.logger.debug(f"🛰️ Sent subscription batch: {payload}")
 
         self.subscribed_channels.update(subscription_args)
-        self.logger.info(f"✅ Initial subscription done for {len(subscription_args)} channels.")
+        self.logger.info(f" Initial subscription done for {len(subscription_args)} channels.")
 
 
 

@@ -63,7 +63,7 @@ class TriggerBot:
             symbols = [row[0] for row in cursor.fetchall()]
 
             for symbol in symbols:
-                for interval in ["1", "5", "60", "D"]:
+                for interval in ["5", "60", "D"]:
                     cursor.execute(f"""
                         SELECT symbol, interval, start_time, close, rsi, macd, volume, volume_ma
                         FROM kline_data

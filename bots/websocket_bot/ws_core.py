@@ -1,245 +1,250 @@
-"""
-    High Performance Websocket Bot for Byebit Exchange
-    This bot is designed to handle high-frequency trading data and publish it to Redis.
-    It subscribes to multiple channels and processes messages in real-time.     
+# ws_core.py
+# --------------------------------------------------------------------------- #
+#  WebSocket Bot – queue-driven, single-socket version                         #
+# --------------------------------------------------------------------------- #
+import json, threading, queue, time, signal, datetime, logging
+import websocket
+from websocket_bot import config_websocket_bot as cfg
+from config        import config_redis        as r_cfg
+from websocket_bot.subscription_handler       import SubscriptionHandler
+from websocket_bot.message_router             import MessageRouter
+from websocket_utils                          import send_webhook
+from utils.logger                             import setup_logger
+from utils.redis_client                       import get_redis
+# --------------------------------------------------------------------------- #
 
-    It also handles reconnections and resubscriptions automatically.
-    The bot is designed to be run as a standalone script and can be easily integrated into other systems.   
+BATCH_SIZE   = getattr(cfg, "BATCH_SIZE", 10)
+ORDER_DEPTH  = getattr(cfg, "ORDER_BOOK_DEPTH", 200)
+PING_SEC     = 20
+PONG_TIMEOUT = 10
+REOPEN_SEC   = 2
 
-    WORK FLOW 27/04/2025:
-    1. subscribe to redis channels COIN_CHANNEL, COIN_FEED_AUTO, BOT_NAME
-
-    Written by: Jericho Sharman
-
-"""
-
-
-import sys, time, os
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))   # Synch folder path
-sys.path.insert(0, project_root)
-if os.name == 'nt':
-    sys.stdout.reconfigure(encoding='utf-8')  # CLI encoding for Windows
-
-# Import necessary libraries
-import websocket,threading
-
-import json, time, redis, datetime, os, requests
-import logging
-from websocket_bot.utils import (
-    setup_logger, send_webhook, extract_symbol,
-    extract_update_seq, is_snapshot
-)
-import config.config_ws as config
-import config.config_redis as config_redis
-from config.config_ws import HEARTBEAT_INTERVAL,LOG_FILENAME,LOG_LEVEL
-from config.config_redis import KLINE_UPDATES,TRADE_CHANNEL,ORDER_BOOK_UPDATES
+# --------------------------------------------------------------------------- #
 class WebSocketBot:
+    """
+    * SubscriptionHandler pushes commands into `cmd_q` (set/add/remove symbols)
+    * This class (re)subscribes on demand and streams raw Bybit messages
+      to MessageRouter → Redis.
+    """
+
+    # ------------------------------------------------------------------ init
     def __init__(self):
-        self.logger = setup_logger(config.LOG_FILENAME, getattr(logging, config.LOG_LEVEL.upper(), logging.WARNING))
-        self.running = True
-        self.redis_client = redis.Redis(
-            host=config_redis.REDIS_HOST,
-            port=config_redis.REDIS_PORT,
-            db=config_redis.REDIS_DB,
-            decode_responses=True
-        )
-        self.symbols = set()
-        self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(config_redis.COIN_CHANNEL, config_redis.COIN_FEED_AUTO, config.BOT_NAME)
+        self.logger  = setup_logger("ws_core.py",
+                                    getattr(logging, cfg.LOG_LEVEL.upper()))
+        self.redis   = get_redis()
 
-        self.last_trade_log_time = {}
-        self.last_snapshot_time = {}
-        self.last_sequences = {}
-        self.ws_running = False
-        send_webhook(config.WEBHOOK, f"WebSocket Bot <@{config.WEBSOCKET_USERID}> started...")
-        self._start_self_heartbeat()
-        self.subscribed_channels = set()  # ✅ Track which channels we are subscribed to
+        # ─ runtime state
+        self.cmd_q        = queue.Queue()
+        self.channels     = set()         # active topics on remote stream
+        self.pending_args = []            # topics queued until WS ready
+        self.symbols      = set()
+        self.market       = "spot"        # spot / linear / inverse
+        self.ws           = None          # websocket.WebSocketApp
+        self.exit_evt     = threading.Event()
 
-    def _start_self_heartbeat(self):
-        def heartbeat():
-            while self.running:
-                payload = {
-                    "bot_name": config.BOT_NAME,
-                    "heartbeat": True,
-                    "time": datetime.datetime.utcnow().isoformat(),
-                    "auth_token": config.BOT_AUTH_TOKEN
-                }
-                try:
-                    self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
-                except Exception as e:
-                    self.logger.warning(f"Heartbeat failed: {e}")
-                time.sleep(config.HEARTBEAT_INTERVAL)
+        self.router       = MessageRouter(self.redis)
 
-        threading.Thread(target=heartbeat, daemon=True).start()
+        # ─ threads
+        threading.Thread(target=self._heartbeat,   daemon=True).start()
+        threading.Thread(target=self._ws_watchdog, daemon=True).start()
 
-    def request_coin_list(self):
-        payload = {
-            "bot_name": "websocket_bot",
-            "request": "resend_coin_list"
-        }
-        print(f"Requesting coin list: {payload}")
-        self.redis_client.publish(config_redis.RESYNC_CHANNEL, json.dumps(payload))
-    def start(self):
-        self.logger.info("WebSocket Bot Starting...")
-        print("WebSocket Bot Starting...")
+        self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q)
+        self.sub_handler.start()
 
-        if not self.ws_running:
-            threading.Thread(
-                target=self._run_websocket,
-                args=(config.SPOT_WEBSOCKET_URL, config.SUBSCRIPTIONS["spot"], "Spot"),
-                daemon=True
-            ).start()
-            self.ws_running = True
-        # Start listener before requesting coins
-        time.sleep(1)  # give the listener thread a chance to subscribe
-        self.request_coin_list()
-        self.logger.info("Coin list request sent after WebSocket and listener ready")
-        # Wait up to 15 seconds for coin list to arrive via pubsub
-        retries = 15
-        while retries > 0 and not self.symbols:
-            self.logger.info(f" Waiting for coin list... ({retries}s left)")
-            time.sleep(1)
-            retries -= 1
-        if not self.symbols:
-            self.logger.error(" No coin list received. Exiting.")
-            sys.exit(1)
-        self.logger.info(f" Coin list received: {self.symbols}")
-    def _run_websocket(self, url, subs, name):
-        while self.running:
+        signal.signal(signal.SIGINT, lambda *_: self.stop())  # Ctrl-C clean exit
+
+    # ===================================================== public ===========
+    def run(self):
+        send_webhook(cfg.DISCORD_WEBHOOK,
+                     f"WebSocket Bot <@{cfg.DISCORD_USER_ID}> started …")
+        self.logger.info("Booted – waiting for subscription commands.")
+
+        while not self.exit_evt.is_set():
             try:
-                ws = websocket.WebSocketApp(
-                    url,
-                    on_open=lambda ws: self._on_open(ws, subs, name),
-                    on_message=lambda ws, msg: self._on_message(ws, msg, name),
-                    on_error=lambda ws, err: self.logger.error(f"{name} WebSocket error: {err}"),
-                    on_close=lambda ws, *_: self.logger.warning("WebSocket disconnected.")
-                )
-                threading.Thread(target=self._listen_for_coin_updates, args=(ws,), daemon=True).start()
-                ws.run_forever(ping_interval=30)
-            except Exception as e:
-                self.logger.error(f"🚨 WebSocket critical error: {e}. Retrying in 5 seconds...")
-                time.sleep(5)
-
-    def _on_open(self, ws, subs, name):
-        self.subscribe_in_batches(ws)
-    def _process_order_book(self, data):
-        return 1
-    def _on_message(self, ws, message, name):
-        try:
-            data = json.loads(message)
-            topic = data.get("topic", "")
-            if "publicTrade" in topic:
-                 self._process_trade(data)
-            elif "orderbook" in topic:
-                self._process_order_book(data)
-            elif "kline" in topic:
-                candle = data["data"][0]
-                confirm_flag = candle["confirm"]
-                if confirm_flag:
-                    interval = candle["interval"]
-                    volume = candle["volume"]
-                    turnover = candle["turnover"]
-                    start_dt = datetime.datetime.utcfromtimestamp(float(candle["start"]) / 1000.0)
-                    symbol = topic.split(".")[-1]
-                    
-                    kline_data = {
-                        "symbol": symbol,
-                        "interval": interval,
-                        "start_time": start_dt.isoformat(),
-                        "open": candle["open"],
-                        "close": candle["close"],
-                        "high": candle["high"],
-                        "low": candle["low"],
-                        "volume": volume,
-                        "turnover": turnover,
-                        "confirmed": True
-                    }
-                    self.redis_client.publish(KLINE_UPDATES, json.dumps(kline_data))
-                ...  # Process candles
-        except Exception as e:
-            self.logger.error(f"Failed to handle message: {e}")
-
-    def _listen_for_coin_updates(self, ws):
-        self.logger.info(" Listening for coin updates on COIN_CHANNEL...")
-        for msg in self.pubsub.listen():
-            if msg["type"] == "message":
-                try:
-                    data = json.loads(msg["data"])
-                    new_symbols = data.get("symbols", [])
-
-                    if new_symbols:
-                        new_symbols_set = set(new_symbols)
-
-                        if self.subscribed_channels:
-                            payload = {"op": "unsubscribe", "args": list(self.subscribed_channels)}
-                            ws.send(json.dumps(payload))
-                            self.logger.info(f" Unsubscribed {len(self.subscribed_channels)} channels.")
-                            self.subscribed_channels.clear()
-
-                        subscription_args = []
-                        for symbol in new_symbols_set:
-                            subscription_args.append(f"publicTrade.{symbol}")
-                            subscription_args.append(f"orderbook.200.{symbol}")
-                            subscription_args.append(f"kline.1.{symbol}")
-                            subscription_args.append(f"kline.5.{symbol}")
-                            subscription_args.append(f"kline.60.{symbol}")
-                            subscription_args.append(f"kline.D.{symbol}")
-
-                        for i in range(0, len(subscription_args), 10):
-                            ws.send(json.dumps({"op": "subscribe", "args": subscription_args[i:i+10]}))
-
-                        self.subscribed_channels.update(subscription_args)
-                        self.symbols = new_symbols_set
-                        self.logger.info(f" Resubscribed to {len(subscription_args)} channels for: {self.symbols}")
-
-                except Exception as e:
-                    self.logger.warning(f"Invalid symbol update: {e}")
-    def _process_trade(self, data):
-        try:
-            trade = data["data"][-1]  # Latest trade
-            symbol = trade["s"]
-            price = float(trade["p"])
-            volume = float(trade["v"])
-            side = trade["S"]  # Buy or Sell
-            trade_time = int(trade["T"]) / 1000  # ms to seconds
-
-            trade_data = {
-                "symbol": symbol,
-                "price": price,
-                "volume": volume,
-                "side": side,
-                "trade_time": datetime.datetime.utcfromtimestamp(trade_time).isoformat()
-            }
-            self.redis_client.publish(TRADE_CHANNEL, json.dumps(trade_data))
-            #self.logger.debug(f" Published trade for {symbol}: {price} x {volume} ({side})")
-
-        except Exception as e:
-            self.logger.error(f"Failed to process trade message: {e}")
-
-    def subscribe_in_batches(self, ws, batch_size=10):
-        if not self.symbols:
-            self.logger.warning(" No symbols to subscribe to.")
-            return
-
-        subscription_args = []
-        for symbol in self.symbols:
-            subscription_args.append(f"publicTrade.{symbol}")
-            subscription_args.append(f"orderbook.200.{symbol}")
-            subscription_args.append(f"kline.1.{symbol}")
-            subscription_args.append(f"kline.5.{symbol}")
-            subscription_args.append(f"kline.60.{symbol}")
-            subscription_args.append(f"kline.D.{symbol}")
-
-        for i in range(0, len(subscription_args), batch_size):
-            payload = {"op": "subscribe", "args": subscription_args[i:i+batch_size]}
-            ws.send(json.dumps(payload))
-            self.logger.debug(f"🛰️ Sent subscription batch: {payload}")
-
-        self.subscribed_channels.update(subscription_args)
-        self.logger.info(f" Initial subscription done for {len(subscription_args)} channels.")
-
-
+                cmd = self.cmd_q.get(timeout=0.5)
+                self._handle_command(cmd)
+            except queue.Empty:
+                continue
 
     def stop(self):
-        self.running = False
-        send_webhook(config.WEBHOOK, "WebSocket Bot has stopped.")
+        if self.exit_evt.is_set():
+            return
+        self.logger.info("🛑 Shutting down WebSocketBot …")
+        self.exit_evt.set()
+
+        # close WS
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+
+        # stop listener
+        try:
+            self.sub_handler.stop()
+        except Exception:
+            pass
+
+        # final status
+        self.redis.publish(
+            r_cfg.SERVICE_STATUS_CHANNEL,
+            json.dumps({
+                "bot_name" : cfg.BOT_NAME,
+                "status"   : "stopped",
+                "time"     : datetime.datetime.utcnow().isoformat(),
+                "auth_token": cfg.BOT_AUTH_TOKEN,
+            })
+        )
+        send_webhook(cfg.DISCORD_WEBHOOK,
+                     f"WebSocket Bot **{cfg.BOT_NAME}** stopped.")
+        self.logger.info("✅ Shutdown complete.")
+
+    # =================================================== internal ===========
+    # ---------------------------------------------------------------- handle
+    def _handle_command(self, cmd: dict):
+        action  = cmd["action"]           # set / add / remove
+        market  = cmd.get("market", "spot")
+        symbols = set(cmd["symbols"])
+
+        # reconnect if market switched
+        if market != self.market:
+            self._disconnect_ws()
+            self.market = market
+            self._spawn_ws_thread()
+
+        # compute new symbol set
+        if action == "set":
+            new_syms = symbols
+        elif action == "add":
+            new_syms = self.symbols | symbols
+        elif action == "remove":
+            new_syms = self.symbols - symbols
+        else:
+            self.logger.warning("Unknown action %s", action)
+            return
+
+        # apply if changed
+        if new_syms != self.symbols:
+            self._resubscribe(new_syms, action)
+        else:
+            self.logger.info("No symbol change.")
+
+    # ---------------------------------------------------------------- resub
+    # --- inside class WebSocketBot ---------------------------------------------
+    def _resubscribe(self, new_syms: set, action: str):
+        # 🔹 ensure we have a live socket first
+        if not self._ws_ready():
+            self._spawn_ws_thread()          # <-- start WS thread immediately
+
+        # ---------- build topic list -------------------------------------------
+        args = []
+        for sym in new_syms:
+            args.extend([
+                f"publicTrade.{sym}",
+                f"orderbook.{ORDER_DEPTH}.{sym}",
+                f"kline.1.{sym}", f"kline.5.{sym}",
+                f"kline.60.{sym}", f"kline.D.{sym}",
+            ])
+        self.pending_args = args            # queue until _flush_pending()
+
+        # flush right away if socket is already connected
+        if self._ws_ready():
+            self._flush_pending()
+
+        # bookkeeping / logging
+        self.symbols = new_syms
+        self.logger.info(
+            "🛰️  action=%s market=%s sym=%s  sub=%d",
+            action, self.market, sorted(new_syms), len(args)
+        )
+
+    # ---------------------------------------------------------------- socket
+    def _spawn_ws_thread(self):
+        if self._ws_ready():
+            return
+
+        def _runner():
+            url = cfg.WS_URL[self.market]
+            while not self.exit_evt.is_set():
+                self.logger.info("Connecting → %s", url)
+
+                self.ws = websocket.WebSocketApp(
+                    url,
+                    on_open    = lambda ws: (self.logger.info("Connected"),
+                                             self._flush_pending()),
+                    on_close   = lambda *_: self.logger.warning("WS closed"),
+                    on_error   = lambda ws, err: self.logger.error("WS error: %s", err),
+                    on_message = self._on_message,
+                    on_pong    = lambda ws, msg=None: self.logger.debug("⏱ pong"),
+                )
+
+                self.ws.run_forever(ping_interval=PING_SEC,
+                                    ping_timeout=PONG_TIMEOUT)
+
+                if self.exit_evt.is_set():
+                    break
+                self.logger.warning("WS lost – reconnecting in %s s …", REOPEN_SEC)
+                time.sleep(REOPEN_SEC)
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def _disconnect_ws(self):
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+        self.ws = None
+        self.channels.clear()
+
+    def _ws_ready(self) -> bool:
+        return self.ws and self.ws.sock and self.ws.sock.connected
+
+    # ---------------------------------------------------------------- flush
+    def _flush_pending(self):
+        if not self.pending_args or not self._ws_ready():
+            return
+        self.logger.info("Sending %d subscribe topics …", len(self.pending_args))
+        for i in range(0, len(self.pending_args), BATCH_SIZE):
+            batch = self.pending_args[i:i+BATCH_SIZE]
+            self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
+            self.logger.debug("SUB-batch %s", batch)
+        self.channels.update(self.pending_args)
+        self.pending_args = []
+
+    # ---------------------------------------------------------------- watch
+    def _ws_watchdog(self):
+        while not self.exit_evt.is_set():
+            if self._ws_ready():
+                self._flush_pending()
+            self.exit_evt.wait(5)
+
+    # ---------------------------------------------------------------- heart
+    def _heartbeat(self):
+        while not self.exit_evt.is_set():
+            try:
+                self.redis.publish(
+                    r_cfg.HEARTBEAT_CHANNEL,
+                    json.dumps({
+                        "bot_name": cfg.BOT_NAME,
+                        "heartbeat": True,
+                        "time": datetime.datetime.utcnow().isoformat(),
+                        "auth_token": cfg.BOT_AUTH_TOKEN,
+                    })
+                )
+            except Exception as e:
+                self.logger.warning("heartbeat failed: %s", e)
+            self.exit_evt.wait(cfg.HEARTBEAT_INTERVAL)
+
+    # ---------------------------------------------------------------- route
+    def _on_message(self, _ws, raw: str):
+        try:
+            data  = json.loads(raw)
+            topic = data.get("topic", "")
+            if   "publicTrade" in topic: self.router.trade(data)
+            elif "kline"       in topic: self.router.kline(data)
+            elif "orderbook"   in topic: self.router.orderbook(data)
+        except Exception as exc:
+            self.logger.error("Parse fail: %s – first 120 chars: %s…",
+                              exc, raw[:120])
+

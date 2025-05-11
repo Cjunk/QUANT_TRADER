@@ -15,9 +15,11 @@ ps.subscribe(
     #config_redis.TRADE_CHANNEL,
     #config_redis.ORDER_BOOK_UPDATES,
     #config_redis.PRE_PROC_KLINE_UPDATES,
-    #config_redis.MACRO_METRICS_CHANNEL
+    #config_redis.MACRO_METRICS_CHANNEL,
+    config_redis.TRIGGER_QUEUE_CHANNEL,
     #config_redis.KLINE_QUEUE_CHANNEL
     #config_redis.HEARTBEAT_CHANNEL,
+    "current_coins",
 )
 
 print("Listening (Press Ctrl+C to stop)...")

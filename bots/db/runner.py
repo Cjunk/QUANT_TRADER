@@ -1,6 +1,8 @@
 # --- runner.py ---
 import sys, os, time
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import signal
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 from db_core import PostgresDBBot
 
 if __name__ == "__main__":

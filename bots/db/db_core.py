@@ -24,6 +24,8 @@ import redis
 import numpy as np
 import os
 import sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 import pytz
 import psycopg2
 import hashlib
@@ -36,10 +38,10 @@ import config.config_ws as ws_config  # If you store Redis host/port here or whe
 from wallet_balance import store_wallet_balances
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
-#from utils.global_indicators import GlobalIndicators # TODO Possible to delete ,central indicators script so all bots and services using the same ones
 from psycopg2.extensions import register_adapter, AsIs
 if os.name == 'nt':
     sys.stdout.reconfigure(encoding='utf-8')
+
 INTERVAL_MAP = {"1": 1, "5": 5, "60": 60, "D": 1440}
 class PostgresDBBot:
     
@@ -80,34 +82,7 @@ class PostgresDBBot:
         self._start_gap_check()
         self.subscribed_channels = set()  # ✅ Track active websocket topics
 
-    def backfill_recent_history(self, symbol="BTCUSDT", days=2):  # PATCHED
-        """
-        One-time script to repopulate fresh kline history for recent N days.
-        Pulls for all configured intervals.
-        """
-        import datetime
-        self.logger.info(f"🚀 Starting backfill of {symbol} for past {days} days")
-        end = pd.Timestamp.utcnow().replace(tzinfo=None)
 
-        for interval, minutes in INTERVAL_MAP.items():
-            # Allow longer historical range for high intervals
-            if interval == "60":
-                start = end - pd.Timedelta(days=30)
-            elif interval == "D":
-                start = end - pd.Timedelta(days=180)
-            else:
-                start = end - pd.Timedelta(days=days)
-
-            self.logger.info(f"🔄 Backfilling {symbol}-{interval} from {start} to {end}")
-            klines = self._fetch_bybit_klines(symbol, interval, minutes, start, end, category='spot')
-            if klines:
-                self.logger.info(f"📈 Fetched {len(klines)} klines: from {klines[0][0]} to {klines[-1][0]}")
-                self._insert_missing_klines(symbol, interval, klines)
-                self.logger.info(f"✅ Inserted {len(klines)} klines for {symbol}-{interval}")
-            else:
-                self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
-                self.logger.warning(f"⚠️ No klines returned for {symbol}-{interval}")
-  
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
     """  
@@ -193,27 +168,20 @@ class PostgresDBBot:
                 print("Redis connection failed. Retrying in 5 seconds...")
                 time.sleep(5)    
  
-
-    def run(self):
-        self.handle_bot_status_update(self.status)
-        """Run loop listening to Redis Pub/Sub channels."""
-        self.large_trade_thresholds = self.get_thresholds()
-        cursor = self.conn.cursor()
-        
-        cursor.execute(f"SET search_path TO {db_config.DB_TRADING_SCHEMA};")
-        self.logger.info("DB Bot running, listening to Redis Pub/Sub...")
+    def _listen_to_redis(self):
+        self.logger.info("🧠 Redis listener thread started.")
         while self.running:
             try:
                 message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
                 if message:
                     channel = message['channel']
                     data_str = message['data']
-                    # Try parse JSON
                     try:
                         data_obj = json.loads(data_str)
                     except json.JSONDecodeError:
                         self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
                         continue
+
                     if channel == config_redis.PRE_PROC_KLINE_UPDATES:
                         self.handle_kline_update(data_obj)
                     elif channel == config_redis.MACRO_METRICS_CHANNEL:
@@ -234,21 +202,20 @@ class PostgresDBBot:
                         self._publish_current_coin_list()
                     else:
                         self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
-            except redis.ConnectionError as e:
-                self.logger.error(f"Redis connection lost: {e}. Reconnecting...")
-                time.sleep(2)  # Wait before retrying
-                self.pubsub = self.redis_client.pubsub()  # Reinitialize Redis Pub/Sub
-                self.pubsub.subscribe(
-                        config_redis.COIN_CHANNEL,
-                        config_redis.PRE_PROC_KLINE_UPDATES,
-                        config_redis.PRE_PROC_TRADE_CHANNEL,
-                        config_redis.PRE_PROC_ORDER_BOOK_UPDATES,
-                        config_redis.RESYNC_CHANNEL,
-                        config_redis.SERVICE_STATUS_CHANNEL,
-                        config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
-                    )
+            except Exception as e:
+                self.logger.error(f"❌ Redis listener error: {e}")
+                time.sleep(2)
 
-            time.sleep(0.1)   
+    def run(self):
+        self.logger.info("DB Bot running, starting Redis listener thread...")
+
+        # Start the Redis listener in a separate thread so it doesn't block
+        threading.Thread(target=self._listen_to_redis, daemon=True).start()
+
+        # Keep the main thread alive but responsive to CTRL+C
+        while self.running:
+            time.sleep(1)
+  
     def close(self):
         """
         Close the database connection cleanly.
@@ -379,24 +346,23 @@ class PostgresDBBot:
         finally:
             cursor.close()
     def _retrieve_coins(self):
-        # The purpose of this function is to ensure that when websocket bot starts it firsts looks for any stored coins in the database and resubscribes.
-        #   This helps in the case of a power outage or crash, websocket bot can resubscribe to current coins without prompting. 
-        #   This should replace the coin_feeder.py for auto updates when websocket starts. 
-        self.logger.info(f"retrieving current_coins")
-        sql = f"""
-            SELECT symbol FROM {db_config.DB_TRADING_SCHEMA}.current_coins
         """
-        cursor = self.conn.cursor()
+        Ensures the WebSocket bot can re-subscribe to coins after restarts or crashes.
+        Fetches the current active symbols from the current_coins table.
+        """
+        self.logger.info("retrieving current_coins")
+        sql = f"SELECT symbol FROM {db_config.DB_TRADING_SCHEMA}.current_coins"
+
         try:
-            cursor.execute(sql)
-            coins = cursor.fetchall()
-            self.logger.info(f"Retrieved {len(coins)} coin(s) from DB")
-            return coins
+            with self.conn.cursor() as cursor:
+                cursor.execute(sql)
+                coins = cursor.fetchall()
+                self.logger.info(f"Retrieved {len(coins)} coin(s) from DB")
+                return coins
         except Exception as e:
             self.logger.error(f"Error retrieving coins: {e}")
             return []
-        finally:
-            cursor.close()
+
     def _publish_current_coin_list(self):
         coins = self._retrieve_coins()
         current_coin_list = [row[0] for row in coins]
@@ -475,7 +441,7 @@ class PostgresDBBot:
         
         try:
             cursor = self.conn.cursor()
-            sql = f"TRUNCATE TABLE {db_config.DB_TRADING_SCHEMA}.current_coins RESTART IDENTITY;"
+            sql = f"DELETE FROM {db_config.DB_TRADING_SCHEMA}.current_coins;"
             cursor.execute(sql)
             #self.conn.commit()              
             sql = f"INSERT INTO {db_config.DB_TRADING_SCHEMA}.current_coins (symbol, timestamp) VALUES (%s, %s);"
@@ -745,8 +711,8 @@ class PostgresDBBot:
     def handle_macro_metrics(self, data):
         try:
             cursor = self.conn.cursor()
-            insert_sql = """
-            INSERT INTO macro_metrics (
+            insert_sql = f"""
+            INSERT INTO {db_config.DB_TRADING_SCHEMA}.macro_metrics (
                 timestamp, btc_dominance, eth_dominance, total_market_cap, total_volume,
                 active_cryptos, markets, fear_greed_index, market_sentiment, btc_open_interest, us_inflation
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -904,7 +870,7 @@ class PostgresDBBot:
     def _insert_missing_klines(self, symbol, interval, klines):
         cursor = self.conn.cursor()
         insert_sql = f"""
-            INSERT INTO trading.kline_data 
+            INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
             (symbol, interval, start_time, open, high, low, close, volume, turnover, confirmed)
             VALUES (%s, %s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s, %s, TRUE)
             ON CONFLICT (symbol, interval, start_time) DO NOTHING

@@ -1,14 +1,6 @@
 import logging, requests
 from config.config_ws import LOG_LEVEL
 
-def setup_logger(logfile, level):
-    logger = logging.getLogger("ws")
-    handler = logging.FileHandler(logfile)
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] - %(message)s")
-    handler.setFormatter(formatter)
-    logger.setLevel(level)
-    logger.addHandler(handler)
-    return logger
 
 def send_webhook(url, message):
     try:

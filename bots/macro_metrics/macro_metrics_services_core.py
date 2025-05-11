@@ -18,10 +18,10 @@ from config.config_auto_macro_metrics_services import BOT_NAME, BOT_AUTH_TOKEN, 
 from config.config_auto_macro_metrics_services import LOG_FILENAME, LOG_LEVEL,FETCH_INTERVAL,MAX_MEMORY_REPORTS
 from fear_and_greed import FearAndGreedIndex
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 class Macro_metrics_services:
-    def __init__(self, logger):
+    def __init__(self, log_filename=LOG_FILENAME):
         self.auth_token = BOT_AUTH_TOKEN
         self.logger = setup_logger(LOG_FILENAME,getattr(logging, LOG_LEVEL.upper(), logging.WARNING)) # Set up logger and retrieve the logger type from config 
         self.redis = redis.Redis(
@@ -71,7 +71,7 @@ class Macro_metrics_services:
                     "time": datetime.datetime.utcnow().isoformat()
                 }
                 self.redis.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
-                self.logger.debug("❤️ Sent heartbeat.")
+                #self.logger.debug("❤️ Sent heartbeat.")
             except Exception as e:
                 self.logger.warning(f"Heartbeat failed: {e}")
             time.sleep(HEARTBEAT_INTERVAL)

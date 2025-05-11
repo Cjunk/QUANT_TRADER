@@ -1,18 +1,23 @@
-# --- preprocessor_core.py (Refactored) ---
+# --- preprocessor_core.py ---
 
-import sys, os, time, json, redis, threading, datetime, pandas as pd, pytz
-import logging
+import os, sys, time, json, redis, threading, datetime, logging, pytz
+import pandas as pd
 from collections import deque
 from utils.logger import setup_logger
 from utils.global_indicators import GlobalIndicators
+
+# Redis + Bot Configs
 from config.config_redis import (
     REDIS_HOST, REDIS_PORT, REDIS_DB,
     KLINE_UPDATES, TRADE_CHANNEL, ORDER_BOOK_UPDATES,
     PRE_PROC_KLINE_UPDATES, PRE_PROC_TRADE_CHANNEL, PRE_PROC_ORDER_BOOK_UPDATES,
     SERVICE_STATUS_CHANNEL, HEARTBEAT_CHANNEL
 )
+
 from config.config_auto_preprocessor_bot import (
-    LOG_FILENAME, LOG_LEVEL, BOT_NAME, BOT_AUTH_TOKEN, HEARTBEAT_INTERVAL, WINDOW_SIZE
+    LOG_FILENAME, LOG_LEVEL, BOT_NAME, BOT_AUTH_TOKEN,
+    HEARTBEAT_INTERVAL, WINDOW_SIZE,
+    STRATEGY_NAME, VERSION, DESCRIPTION
 )
 
 class PreprocessorBot:
@@ -22,14 +27,16 @@ class PreprocessorBot:
         self.auth_token = BOT_AUTH_TOKEN
         self.running = True
         self.GlobalIndicators = GlobalIndicators()
-        self.kline_windows = {}  # {(symbol, interval): deque}
-        self.trade_windows = {} # {(symbol, minute): list of trades}
-
+        self.kline_windows = {}   # {(symbol, interval): deque}
+        self.trade_windows = {}   # {(symbol, minute): [trades]}
+    
     def _connect_redis(self):
-        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+        self.redis_client = redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
+        )
         self.pubsub = self.redis_client.pubsub()
         self.pubsub.subscribe(KLINE_UPDATES, TRADE_CHANNEL, ORDER_BOOK_UPDATES)
-        self.logger.info("✅ Connected to Redis and subscribed to channels.")
+        self.logger.info("✅ Connected to Redis and subscribed to required channels.")
 
     def _register_bot(self):
         payload = {
@@ -37,7 +44,11 @@ class PreprocessorBot:
             "status": "started",
             "time": datetime.datetime.utcnow().isoformat(),
             "auth_token": self.auth_token,
-            "metadata": {"version": "1.0", "pid": os.getpid(), "description": "Preprocessor bot"}
+            "metadata": {
+                "version": VERSION,
+                "pid": os.getpid(),
+                "description": DESCRIPTION
+            }
         }
         self.redis_client.publish(SERVICE_STATUS_CHANNEL, json.dumps(payload))
         self.logger.info(f"🔐 Registered bot '{self.bot_name}' with status 'started'.")
@@ -50,10 +61,10 @@ class PreprocessorBot:
                     "heartbeat": True,
                     "time": datetime.datetime.now(pytz.timezone("Australia/Sydney")).isoformat(),
                     "metadata": {
-                            "version": "1.2.0",
-                            "pid": os.getpid(),
-                            "strategy": "VWAP"
-                        }
+                        "version": VERSION,
+                        "pid": os.getpid(),
+                        "strategy": STRATEGY_NAME
+                    }
                 }
                 self.redis_client.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
                 self.logger.debug("❤️ Sent heartbeat.")
@@ -90,8 +101,7 @@ class PreprocessorBot:
             self._process_orderbook(payload)
 
     def _process_kline(self, payload):
-        symbol = payload['symbol']
-        interval = payload['interval']
+        symbol, interval = payload['symbol'], payload['interval']
         key = (symbol, interval)
         redis_key = f"kline_window:{symbol}:{interval}"
 
@@ -103,7 +113,7 @@ class PreprocessorBot:
         if self.kline_windows[key]:
             last = self.kline_windows[key][-1]
             if last['start_time'] == payload['start_time'] and last['close'] == payload['close']:
-                self.logger.debug("🔁 Duplicate kline detected, skipping republish.")
+                self.logger.debug("🔁 Duplicate kline detected. Skipping.")
                 return
 
         self.kline_windows[key].append(payload)
@@ -124,14 +134,11 @@ class PreprocessorBot:
         try:
             symbol = payload['symbol']
             trade_time = pd.to_datetime(payload['trade_time'], utc=True).floor('min')
-            price = payload['price']
-            volume = payload['volume']
-
             key = (symbol, trade_time)
-            if key not in self.trade_windows:
-                self.trade_windows[key] = []
-
-            self.trade_windows[key].append({"price": price, "volume": volume})
+            self.trade_windows.setdefault(key, []).append({
+                "price": payload['price'],
+                "volume": payload['volume']
+            })
         except Exception as e:
             self.logger.error(f"❌ Error processing trade: {e}")
 
@@ -139,7 +146,6 @@ class PreprocessorBot:
         symbol, minute_start = key
         total_volume = sum(t['volume'] for t in trades)
         vwap = sum(t['price'] * t['volume'] for t in trades) / total_volume if total_volume > 0 else 0
-        trade_count = len(trades)
         max_trade = max(trades, key=lambda t: t['volume'], default={"volume": 0, "price": 0})
 
         summary = {
@@ -147,7 +153,7 @@ class PreprocessorBot:
             "minute_start": minute_start.isoformat(),
             "total_volume": total_volume,
             "vwap": vwap,
-            "trade_count": trade_count,
+            "trade_count": len(trades),
             "largest_trade_volume": max_trade['volume'],
             "largest_trade_price": max_trade['price']
         }
@@ -169,8 +175,7 @@ class PreprocessorBot:
             "bot_name": self.bot_name,
             "status": "stopped",
             "time": datetime.datetime.utcnow().isoformat(),
-            "auth_token": self.auth_token,
-
+            "auth_token": self.auth_token
         }
         self.redis_client.publish(SERVICE_STATUS_CHANNEL, json.dumps(payload))
         self.logger.info("🛑 Preprocessor Bot stopped.")
@@ -181,21 +186,17 @@ class PreprocessorBot:
         threading.Thread(target=self._start_heartbeat, daemon=True).start()
         threading.Thread(target=self._listen_redis, daemon=True).start()
         threading.Thread(target=self._flush_old_trades, daemon=True).start()
-
-        self.logger.info("🚀 Preprocessor Bot running...")
-
+        self.logger.info("🚀 Preprocessor Bot is running...")
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            self.logger.warning("🛑 Keyboard Interrupt received. Stopping...")
+            self.logger.warning("🛑 Keyboard Interrupt received.")
             self.stop()
 
 if __name__ == "__main__":
     if sys.prefix == sys.base_prefix:
-        print("❌ Virtual environment is NOT activated! Please activate it first.")
+        print("❌ Virtual environment is NOT activated. Please activate it.")
         sys.exit(1)
-
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 🚀 Starting Preprocessor Bot...")
-    bot = PreprocessorBot()
-    bot.run()
+    PreprocessorBot().run()

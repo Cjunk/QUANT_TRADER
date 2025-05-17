@@ -1,67 +1,46 @@
-# ws_core.py
-# --------------------------------------------------------------------------- #
-#  WebSocket Bot – queue-driven, single-socket version                         #
-# --------------------------------------------------------------------------- #
 import json, threading, queue, time, signal, datetime, logging
 import websocket
-from websocket_bot import config_websocket_bot as cfg
-from config        import config_redis        as r_cfg
-from websocket_bot.subscription_handler       import SubscriptionHandler
-from websocket_bot.message_router             import MessageRouter
-from websocket_utils                          import send_webhook
-from utils.logger                             import setup_logger
-from utils.redis_client                       import get_redis
-# --------------------------------------------------------------------------- #
+import bots.websocket_bot.config_websocket_bot as cfg
+from bots.config import config_redis as r_cfg
+from bots.websocket_bot.subscription_handler import SubscriptionHandler
+from bots.websocket_bot.message_router import MessageRouter
+from bots.websocket_bot.websocket_utils import send_webhook
+from bots.utils.logger import setup_logger
+from bots.utils.redis_client import get_redis
 
-BATCH_SIZE   = getattr(cfg, "BATCH_SIZE", 10)
-ORDER_DEPTH  = getattr(cfg, "ORDER_BOOK_DEPTH", 200)
-PING_SEC     = 20
-PONG_TIMEOUT = 10
-REOPEN_SEC   = 2
+BATCH_SIZE = getattr(cfg, "BATCH_SIZE", 10)
+PING_SEC, PONG_TIMEOUT, REOPEN_SEC = 20, 10, 2
 
-# --------------------------------------------------------------------------- #
-class WebSocketBot:
-    """
-    * SubscriptionHandler pushes commands into `cmd_q` (set/add/remove symbols)
-    * This class (re)subscribes on demand and streams raw Bybit messages
-      to MessageRouter → Redis.
-    """
-
-    # ------------------------------------------------------------------ init
-    def __init__(self):
-        self.logger  = setup_logger("ws_core.py",
-                                    getattr(logging, cfg.LOG_LEVEL.upper()))
-        self.redis   = get_redis()
-
-        # ─ runtime state
-        self.cmd_q        = queue.Queue()
-        self.channels     = set()         # active topics on remote stream
-        self.pending_args = []            # topics queued until WS ready
-        self.symbols      = set()
-        self.market       = "spot"        # spot / linear / inverse
-        self.ws           = None          # websocket.WebSocketApp
-        self.exit_evt     = threading.Event()
-
-        self.router       = MessageRouter(self.redis)
-
-        # ─ threads
-        threading.Thread(target=self._heartbeat,   daemon=True).start()
-        threading.Thread(target=self._ws_watchdog, daemon=True).start()
+class WebSocketBot(threading.Thread):
+    def __init__(self, market):
+        super().__init__(daemon=True)
+        self.logger = setup_logger(f"{market}_ws_core.py", logging.INFO)
+        self.redis = get_redis()
+        self.cmd_q = queue.Queue()
+        self.ws = None
+        self.market = "linear"
+        self.subscriptions = set()
+        self.pending_subscriptions = []
+        self.channels = set()
+        self.exit_evt = threading.Event()
+        self.router = MessageRouter(self.redis,market=market)
 
         self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q)
         self.sub_handler.start()
 
-        signal.signal(signal.SIGINT, lambda *_: self.stop())  # Ctrl-C clean exit
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+        threading.Thread(target=self._ws_watchdog, daemon=True).start()
 
-    # ===================================================== public ===========
+        signal.signal(signal.SIGINT, lambda *_: self.stop())
+        # Load subscriptions from Redis at startup
+        self._load_subscriptions_from_redis()
+        self._connect_ws()
     def run(self):
-        send_webhook(cfg.DISCORD_WEBHOOK,
-                     f"WebSocket Bot <@{cfg.DISCORD_USER_ID}> started …")
-        self.logger.info("Booted – waiting for subscription commands.")
-
+        send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot started.")
+        self.logger.info("🚀 WebSocketBot running.")
         while not self.exit_evt.is_set():
             try:
-                cmd = self.cmd_q.get(timeout=0.5)
+                cmd = self.cmd_q.get(timeout=1)
                 self._handle_command(cmd)
             except queue.Empty:
                 continue
@@ -69,182 +48,223 @@ class WebSocketBot:
     def stop(self):
         if self.exit_evt.is_set():
             return
-        self.logger.info("🛑 Shutting down WebSocketBot …")
+        self.logger.info("🛑 Shutting down...")
         self.exit_evt.set()
 
-        # close WS
-        try:
-            if self.ws:
+        if self.ws and self.ws.sock:
+            try:
                 self.ws.close()
-        except Exception:
-            pass
+                self.logger.info("🟢 WebSocket closed successfully.")
+            except Exception as e:
+                self.logger.error(f"⚠️ WebSocket close failed: {e}")
 
-        # stop listener
-        try:
+        if self.sub_handler:
             self.sub_handler.stop()
-        except Exception:
-            pass
 
-        # final status
-        self.redis.publish(
-            r_cfg.SERVICE_STATUS_CHANNEL,
-            json.dumps({
-                "bot_name" : cfg.BOT_NAME,
-                "status"   : "stopped",
-                "time"     : datetime.datetime.utcnow().isoformat(),
-                "auth_token": cfg.BOT_AUTH_TOKEN,
-            })
-        )
-        send_webhook(cfg.DISCORD_WEBHOOK,
-                     f"WebSocket Bot **{cfg.BOT_NAME}** stopped.")
+        self._save_subscriptions_to_redis()
+        send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
         self.logger.info("✅ Shutdown complete.")
 
-    # =================================================== internal ===========
-    # ---------------------------------------------------------------- handle
-    def _handle_command(self, cmd: dict):
-        action  = cmd["action"]           # set / add / remove
-        market  = cmd.get("market", "spot")
-        symbols = set(cmd["symbols"])
+    def _save_subscriptions_to_redis(self):
+        self.redis.delete(r_cfg.REDIS_SUBSCRIPTION_KEY)
+        if self.subscriptions:
+            self.redis.sadd(r_cfg.REDIS_SUBSCRIPTION_KEY, *self.subscriptions)
+            self.logger.info("💾 Saved current subscriptions to Redis: %s", self.subscriptions)
+        else:
+            self.logger.info("⚠️ No subscriptions to save.")
+    def log_current_subscriptions(self):
+        if self.subscriptions:
+            self.logger.info("📡 Current subscriptions (%d): %s",
+                        len(self.subscriptions), ', '.join(sorted(self.subscriptions)))
+        else:
+            self.logger.info("📡 No active subscriptions.")
+    def _load_subscriptions_from_redis(self):
+        saved_subscriptions = self.redis.smembers(r_cfg.REDIS_SUBSCRIPTION_KEY)
+        if saved_subscriptions:
+            self.subscriptions = {sub for sub in saved_subscriptions}
+            self.logger.info("🔄 Loaded subscriptions from Redis: %s", self.subscriptions)
+            self.log_current_subscriptions()
+        else:
+            self.logger.info("⚠️ No subscriptions found in Redis at startup.")
+    def _handle_command(self, cmd):
+        action = cmd.get("action", "add")
+        market = cmd.get("market", "linear")
+        symbols = cmd.get("symbols", [])
+        channels = cmd.get("topics", ["trade", "orderbook", "kline.1", "kline.5", "kline.60", "kline.D"])
 
-        # reconnect if market switched
         if market != self.market:
-            self._disconnect_ws()
-            self.market = market
-            self._spawn_ws_thread()
+            self.logger.info(f"🔄 Market change detected: {self.market} → {market}")
+            self._change_market(market)
 
-        # compute new symbol set
+        new_subs = self._build_subscriptions(symbols, channels)
+
         if action == "set":
-            new_syms = symbols
+            self.subscriptions = new_subs
         elif action == "add":
-            new_syms = self.symbols | symbols
+            self.subscriptions |= new_subs
         elif action == "remove":
-            new_syms = self.symbols - symbols
-        else:
-            self.logger.warning("Unknown action %s", action)
+            self.subscriptions -= new_subs
+
+        self._update_subscriptions()
+
+    def _build_subscriptions(self, symbols, channels):
+        subs = set()
+        for sym in symbols:
+            for channel in channels:
+                if channel.startswith("kline."):
+                    interval = channel.split(".")[1]
+                    subs.add(f"{self.market}:kline.{interval}.{sym}")
+                elif channel.startswith("orderbook"):
+                    depth = channel.split(".")[1] if "." in channel else cfg.ORDER_BOOK_DEPTH
+                    subs.add(f"{self.market}:orderbook.{depth}.{sym}")
+                elif channel == "trade":
+                    subs.add(f"{self.market}:publicTrade.{sym}")
+        return subs
+
+    def _change_market(self, new_market):
+        if new_market == self.market:
+            self.logger.info("🔵 Market unchanged (%s), no action taken.", new_market)
             return
 
-        # apply if changed
-        if new_syms != self.symbols:
-            self._resubscribe(new_syms, action)
-        else:
-            self.logger.info("No symbol change.")
+        self.logger.info(f"🔄 Market change detected: {self.market} → {new_market}")
 
-    # ---------------------------------------------------------------- resub
-    # --- inside class WebSocketBot ---------------------------------------------
-    def _resubscribe(self, new_syms: set, action: str):
-        # 🔹 ensure we have a live socket first
-        if not self._ws_ready():
-            self._spawn_ws_thread()          # <-- start WS thread immediately
+        if self.ws:
+            try:
+                self.ws.close()
+                self.logger.info("🟢 WebSocket closed for market change.")
+            except Exception as e:
+                self.logger.warning("⚠️ Error closing WebSocket: %s", e)
+            finally:
+                self.ws = None
 
-        # ---------- build topic list -------------------------------------------
-        args = []
-        for sym in new_syms:
-            args.extend([
-                f"publicTrade.{sym}",
-                f"orderbook.{ORDER_DEPTH}.{sym}",
-                f"kline.1.{sym}", f"kline.5.{sym}",
-                f"kline.60.{sym}", f"kline.D.{sym}",
-            ])
-        self.pending_args = args            # queue until _flush_pending()
+        self.channels.clear()
+        self.subscriptions.clear()
+        self.market = new_market
 
-        # flush right away if socket is already connected
-        if self._ws_ready():
-            self._flush_pending()
+        self._connect_ws()
 
-        # bookkeeping / logging
-        self.symbols = new_syms
-        self.logger.info(
-            "🛰️  action=%s market=%s sym=%s  sub=%d",
-            action, self.market, sorted(new_syms), len(args)
-        )
 
-    # ---------------------------------------------------------------- socket
-    def _spawn_ws_thread(self):
-        if self._ws_ready():
+    def _update_subscriptions(self):
+        if not self.ws or not self.ws.sock or not self.ws.sock.connected:
+            self.logger.warning("⚠️ WebSocket disconnected; subscriptions delayed.")
             return
+
+        new_subscriptions = self.subscriptions
+        current_channels = set(self.channels)
+
+        to_subscribe = new_subscriptions - current_channels
+        to_unsubscribe = current_channels - new_subscriptions
+
+        if to_unsubscribe:
+            self.logger.info("🚫 Unsubscribing from %d topics", len(to_unsubscribe))
+            for i in range(0, len(to_unsubscribe), BATCH_SIZE):
+                batch = list(to_unsubscribe)[i:i+BATCH_SIZE]
+                self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
+                self.logger.debug(f"Unsubscribed batch: {batch}")
+            self.channels -= to_unsubscribe
+
+        if to_subscribe:
+            self.logger.info("✅ Subscribing to %d new topics", len(to_subscribe))
+            for i in range(0, len(to_subscribe), BATCH_SIZE):
+                batch = list(to_subscribe)[i:i+BATCH_SIZE]
+                self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
+                self.logger.debug(f"Subscribed batch: {batch}")
+            self.channels |= to_subscribe
+
+        if not to_subscribe and not to_unsubscribe:
+            self.logger.info("🟢 No subscription changes needed.")
+
+        self.log_current_subscriptions()
+
+
+
+
+    def _connect_ws(self):
+        url = cfg.WS_URL[self.market]
 
         def _runner():
-            url = cfg.WS_URL[self.market]
             while not self.exit_evt.is_set():
-                self.logger.info("Connecting → %s", url)
-
                 self.ws = websocket.WebSocketApp(
                     url,
-                    on_open    = lambda ws: (self.logger.info("Connected"),
-                                             self._flush_pending()),
-                    on_close   = lambda *_: self.logger.warning("WS closed"),
-                    on_error   = lambda ws, err: self.logger.error("WS error: %s", err),
-                    on_message = self._on_message,
-                    on_pong    = lambda ws, msg=None: self.logger.debug("⏱ pong"),
+                    on_open=lambda ws: (
+                        self.logger.info("WS connected"),
+                        self._update_subscriptions()  # <-- ONLY UPDATE HERE
+                    ),
+                    on_message=self._on_message,
+                    on_error=lambda ws, err: self.logger.error(f"WS error: {err}"),
+                    on_close=lambda *_: self.logger.warning("WS closed"),
+                    on_pong=lambda *_: self.logger.debug("pong"),
                 )
-
-                self.ws.run_forever(ping_interval=PING_SEC,
-                                    ping_timeout=PONG_TIMEOUT)
-
-                if self.exit_evt.is_set():
-                    break
-                self.logger.warning("WS lost – reconnecting in %s s …", REOPEN_SEC)
-                time.sleep(REOPEN_SEC)
+                self.ws.run_forever(ping_interval=PING_SEC, ping_timeout=PONG_TIMEOUT)
+                if not self.exit_evt.is_set():
+                    self.logger.warning(f"Reconnecting WS in {REOPEN_SEC}s...")
+                    time.sleep(REOPEN_SEC)
 
         threading.Thread(target=_runner, daemon=True).start()
 
-    def _disconnect_ws(self):
-        try:
-            if self.ws:
-                self.ws.close()
-        except Exception:
-            pass
-        self.ws = None
-        self.channels.clear()
 
-    def _ws_ready(self) -> bool:
-        return self.ws and self.ws.sock and self.ws.sock.connected
-
-    # ---------------------------------------------------------------- flush
     def _flush_pending(self):
-        if not self.pending_args or not self._ws_ready():
+        if not self.pending_subscriptions:
             return
-        self.logger.info("Sending %d subscribe topics …", len(self.pending_args))
-        for i in range(0, len(self.pending_args), BATCH_SIZE):
-            batch = self.pending_args[i:i+BATCH_SIZE]
-            self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
-            self.logger.debug("SUB-batch %s", batch)
-        self.channels.update(self.pending_args)
-        self.pending_args = []
+        if not self.ws or not self.ws.sock or not self.ws.sock.connected:
+            self.logger.warning("⚠️ WebSocket not connected yet, delaying subscription.")
+            return
 
-    # ---------------------------------------------------------------- watch
+        self.logger.info(f"✅ Subscribing to {len(self.pending_subscriptions)} new topics")
+        for i in range(0, len(self.pending_subscriptions), BATCH_SIZE):
+            batch = self.pending_subscriptions[i:i+BATCH_SIZE]
+            try:
+                self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
+            except websocket.WebSocketConnectionClosedException:
+                self.logger.warning("⚠️ WebSocket unexpectedly closed during subscription.")
+                self.ws = None  # Reset connection to trigger reconnection
+                return
+
+        self.pending_subscriptions.clear()  # Clear subscriptions after successful send
+
+
     def _ws_watchdog(self):
         while not self.exit_evt.is_set():
-            if self._ws_ready():
+            if self.ws and self.ws.sock and self.ws.sock.connected:
                 self._flush_pending()
             self.exit_evt.wait(5)
 
-    # ---------------------------------------------------------------- heart
     def _heartbeat(self):
         while not self.exit_evt.is_set():
-            try:
-                self.redis.publish(
-                    r_cfg.HEARTBEAT_CHANNEL,
-                    json.dumps({
-                        "bot_name": cfg.BOT_NAME,
-                        "heartbeat": True,
-                        "time": datetime.datetime.utcnow().isoformat(),
-                        "auth_token": cfg.BOT_AUTH_TOKEN,
-                    })
-                )
-            except Exception as e:
-                self.logger.warning("heartbeat failed: %s", e)
+            self.redis.publish(r_cfg.HEARTBEAT_CHANNEL, json.dumps({
+                "bot_name": cfg.BOT_NAME,
+                "heartbeat": True,
+                "time": datetime.datetime.utcnow().isoformat(),
+                "auth_token": cfg.BOT_AUTH_TOKEN
+            }))
             self.exit_evt.wait(cfg.HEARTBEAT_INTERVAL)
 
-    # ---------------------------------------------------------------- route
     def _on_message(self, _ws, raw: str):
         try:
-            data  = json.loads(raw)
+            data = json.loads(raw)
             topic = data.get("topic", "")
-            if   "publicTrade" in topic: self.router.trade(data)
-            elif "kline"       in topic: self.router.kline(data)
-            elif "orderbook"   in topic: self.router.orderbook(data)
+            if "kline" in topic:
+                _, interval, symbol = topic.split(".")
+                self.logger.debug("KLINE → %s %s", symbol, interval)
+            elif "orderbook" in topic:
+                _, depth, symbol = topic.split(".")
+                self.logger.debug("ORDERBOOK → %s depth %s", symbol, depth)
+            elif "publicTrade" in topic:
+                _, symbol = topic.split(".")
+                self.logger.debug("TRADE → %s", symbol)
+
+            # Routing (unchanged)
+            if "publicTrade" in topic:
+                self.router.trade(data)
+            elif "kline" in topic:
+                self.router.kline(data)
+            elif "orderbook" in topic:
+                self.router.orderbook(data)
+
         except Exception as exc:
             self.logger.error("Parse fail: %s – first 120 chars: %s…",
                               exc, raw[:120])
+
+
+
 

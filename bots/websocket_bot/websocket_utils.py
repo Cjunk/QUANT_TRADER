@@ -1,5 +1,5 @@
 import logging, requests
-from config.config_ws import LOG_LEVEL
+from bots.config.config_ws import LOG_LEVEL
 
 
 def send_webhook(url, message):

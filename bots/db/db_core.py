@@ -516,7 +516,7 @@ class PostgresDBBot:
     def _archive_kline_data(self):
         timestamp = datetime.datetime.now(pytz.timezone("Australia/Sydney")).strftime("%Y%m%d_%H%M%S")
 
-        archive_table = f"kline_data_{timestamp}"
+        archive_table = f"{db_config.DB_TRADING_SCHEMA}.kline_data_{timestamp}"
         cursor = self.conn.cursor()
         try:
             cursor.execute(f"CREATE TABLE {archive_table} AS SELECT * FROM {db_config.DB_TRADING_SCHEMA}.kline_data;")
@@ -789,7 +789,7 @@ class PostgresDBBot:
                 start_gap = gap.min()
                 end_gap = gap.max()
                 self.logger.info(f"Gap detected: {start_gap} to {end_gap} ({symbol}-{interval})")
-                klines = self._fetch_bybit_klines(symbol, interval, interval_minutes, start_gap, end_gap + pd.Timedelta(minutes=interval_minutes), category='spot')
+                klines = self._fetch_bybit_klines(symbol, interval, interval_minutes, start_gap, end_gap + pd.Timedelta(minutes=interval_minutes), category='linear')
                 expected = int(((end_gap + pd.Timedelta(minutes=interval_minutes)) - start_gap).total_seconds() // 60 // interval_minutes)
                 if len(klines) > expected:
                     self.logger.warning(f"Bybit returned {len(klines)} candles for a range that should have only {expected} — slicing to expected")
@@ -817,7 +817,7 @@ class PostgresDBBot:
                     interval_minutes,
                     last_time + pd.Timedelta(minutes=interval_minutes),
                     now,
-                    category='spot'
+                    category='linear'
                 )
                 if klines:
                     self._insert_missing_klines(symbol, interval, klines)
@@ -831,7 +831,7 @@ class PostgresDBBot:
             cursor.close()
 
 
-    def _fetch_bybit_klines(self, symbol, interval, interval_minutes, start_time, end_time, category='spot'):
+    def _fetch_bybit_klines(self, symbol, interval, interval_minutes, start_time, end_time, category='linear'):
         import requests
         klines = []
         start_ts = int(start_time.timestamp() * 1000)  # RESTORED TO UTC-BASED DYNAMIC TIME
@@ -845,7 +845,7 @@ class PostgresDBBot:
                 'limit': 1000,
                 'category': category
             }
-            self.logger.debug(f"🛰️ Fetching Bybit SPOT klines for {symbol}-{interval} from {start_time} to {end_time} (UTC)")
+            self.logger.debug(f"🛰️ Fetching Bybit LINEAR klines for {symbol}-{interval} from {start_time} to {end_time} (UTC)")
 
             resp = requests.get("https://api.bybit.com/v5/market/kline", params=params).json()
 

@@ -1,27 +1,35 @@
-import signal, sys, time, os
+import signal, sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from ws_core import WebSocketBot
+from bots.websocket_bot.ws_core import WebSocketBot
 
 def main():
     if sys.prefix == sys.base_prefix:
         print("❌ Activate your virtualenv first.")
         sys.exit(1)
 
-    bot = WebSocketBot()
+    # create and start the bots (threads)
+    linear_bot = WebSocketBot(market="linear")
+    spot_bot = WebSocketBot(market="spot")
 
-    # Catch Ctrl-C and call bot.stop()
+    linear_bot.start()
+    spot_bot.start()
+
+    # handle Ctrl+C properly for both bots
     def handle_sigint(sig, frame):
-        bot.stop()
+        linear_bot.stop()
+        spot_bot.stop()
+        linear_bot.join()
+        spot_bot.join()
+        print("✅ Bots stopped gracefully.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    bot.run()   # blocks until bot.stop() sets running = False
+    linear_bot.join()
+    spot_bot.join()
 
 if __name__ == "__main__":
-    bot = WebSocketBot()
-    try:
-        bot.run()
-    finally:
-        bot.stop()          # in case we exited via exception
+    main()
+
+

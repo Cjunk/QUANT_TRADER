@@ -41,7 +41,7 @@ class TriggerBot:
         self.pubsub = None
         self.db_conn = None
         self.windows = {}  # {(symbol, interval): deque}
-        self.WINDOW_SIZE = 30
+        self.WINDOW_SIZE = 20
 
     def connect_postgres(self):
         try:
@@ -193,8 +193,8 @@ class TriggerBot:
     def analyze_trend(self, key):
         symbol, interval = key
         DEV_MODE = True  # Set False for production
-        MA_WINDOW = 7 if DEV_MODE else 200  # shorter MA in DEV
-        MIN_CONFIDENCE = 30 if DEV_MODE else 65  # Lower confidence threshold in DEV
+        MA_WINDOW = 5 if DEV_MODE else 200  # shorter MA in DEV
+        MIN_CONFIDENCE = 20 if DEV_MODE else 65  # Lower confidence threshold in DEV
 
         try:
             # 📊 Clean raw DataFrame
@@ -258,7 +258,7 @@ class TriggerBot:
                 self.logger.warning(f"⚠️ Insufficient daily data (<{MA_WINDOW}), using neutral daily bias.")
 
             # ✅ Refined Trend Trigger
-            if confidence >= MIN_CONFIDENCE and abs(price_slope) > 0.005 and rvol > 1:
+            if confidence >= MIN_CONFIDENCE and abs(price_slope) > 0.003 and rvol > 0.8:
                 direction = "long" if price_slope > 0 else "short"
 
                 # 🚩 Emit triggers (allow neutral bias in DEV mode)

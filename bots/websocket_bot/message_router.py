@@ -1,7 +1,8 @@
 import datetime, json, logging, time
 from collections import defaultdict
-from bots.websocket_bot.config_websocket_bot import REDIS_CHANNEL, ORDER_BOOK_DEPTH
+
 from bots.config import config_redis as r_cfg
+from bots.websocket_bot.config_websocket_bot import ORDER_BOOK_DEPTH
 from bots.utils.logger import setup_logger
 
 # Global trackers
@@ -72,7 +73,7 @@ class MessageRouter:
             "side": trade["S"],
             "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat()
         }
-        channel = REDIS_CHANNEL[f"{self.market}.trade_out"]
+        channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
         self.redis.publish(channel, json.dumps(trade_data))
 
 
@@ -95,8 +96,8 @@ class MessageRouter:
                 "turnover": c["turnover"],
                 "confirmed": True
             }
-            channel = REDIS_CHANNEL[f"{self.market}.kline_out"]
-            self.redis.publish(REDIS_CHANNEL[f"{self.market}.kline_out"], json.dumps(out))
+            channel = r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"]
+            self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"], json.dumps(out))
             self.logger.debug(f"KLINE → {sym} {interval}")
         except Exception as exc:
             self.logger.error(f"kline() parse error: {exc}  RAW={msg}")
@@ -147,7 +148,7 @@ class MessageRouter:
                     "timestamp": datetime.datetime.utcnow().isoformat()
                 }
 
-                self.redis.publish(REDIS_CHANNEL[f"{self.market}.orderbook_out"], json.dumps(aggregated_payload))
+                self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_out"], json.dumps(aggregated_payload))
                 _last_published_time[sym] = now
                 self.logger.debug("✅ Aggregated orderbook published for %s", sym)
 

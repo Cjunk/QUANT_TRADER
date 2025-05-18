@@ -14,30 +14,37 @@ PING_SEC, PONG_TIMEOUT, REOPEN_SEC = 20, 10, 2
 class WebSocketBot(threading.Thread):
     def __init__(self, market):
         super().__init__(daemon=True)
+        self.market = market
         self.logger = setup_logger(f"{market}_ws_core.py", logging.INFO)
         self.redis = get_redis()
         self.cmd_q = queue.Queue()
         self.ws = None
-        self.market = "linear"
         self.subscriptions = set()
         self.pending_subscriptions = []
         self.channels = set()
         self.exit_evt = threading.Event()
-        self.router = MessageRouter(self.redis,market=market)
+        self.router = MessageRouter(self.redis, market=market)
 
-        self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q)
+        # Choose the correct subscription channel based on market
+        if self.market == "spot":
+            subscription_channel = r_cfg.SPOT_SUBSCRIPTION_CHANNEL
+        elif self.market == "linear":
+            subscription_channel = r_cfg.LINEAR_SUBSCRIPTION_CHANNEL
+        else:
+            subscription_channel = r_cfg.SPOT_SUBSCRIPTION_CHANNEL
+
+        self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q, subscription_channel=subscription_channel)
         self.sub_handler.start()
 
         threading.Thread(target=self._heartbeat, daemon=True).start()
         threading.Thread(target=self._ws_watchdog, daemon=True).start()
 
-        signal.signal(signal.SIGINT, lambda *_: self.stop())
         # Load subscriptions from Redis at startup
         self._load_subscriptions_from_redis()
         self._connect_ws()
     def run(self):
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot started.")
-        self.logger.info("🚀 WebSocketBot running.")
+        self.logger.info(f"🚀 WebSocketBot running. {self.market}")
         while not self.exit_evt.is_set():
             try:
                 cmd = self.cmd_q.get(timeout=1)
@@ -66,12 +73,15 @@ class WebSocketBot(threading.Thread):
         self.logger.info("✅ Shutdown complete.")
 
     def _save_subscriptions_to_redis(self):
-        self.redis.delete(r_cfg.REDIS_SUBSCRIPTION_KEY)
+        key = self._redis_key()
+        self.redis.delete(key)
         if self.subscriptions:
-            self.redis.sadd(r_cfg.REDIS_SUBSCRIPTION_KEY, *self.subscriptions)
-            self.logger.info("💾 Saved current subscriptions to Redis: %s", self.subscriptions)
+            self.redis.sadd(key, *self.subscriptions)
+            self.logger.info(f"💾 Saved current subscriptions to Redis: {self.market} {self.subscriptions}")
         else:
             self.logger.info("⚠️ No subscriptions to save.")
+    def _redis_key(self):
+        return f"{r_cfg.REDIS_SUBSCRIPTION_KEY}:{self.market}"
     def log_current_subscriptions(self):
         if self.subscriptions:
             self.logger.info("📡 Current subscriptions (%d): %s",
@@ -79,10 +89,11 @@ class WebSocketBot(threading.Thread):
         else:
             self.logger.info("📡 No active subscriptions.")
     def _load_subscriptions_from_redis(self):
-        saved_subscriptions = self.redis.smembers(r_cfg.REDIS_SUBSCRIPTION_KEY)
+        key = self._redis_key()
+        saved_subscriptions = self.redis.smembers(key)
         if saved_subscriptions:
             self.subscriptions = {sub for sub in saved_subscriptions}
-            self.logger.info("🔄 Loaded subscriptions from Redis: %s", self.subscriptions)
+            self.logger.info(f"🔄 Loaded subscriptions from Redis: {self.market} {self.subscriptions}")
             self.log_current_subscriptions()
         else:
             self.logger.info("⚠️ No subscriptions found in Redis at startup.")
@@ -113,12 +124,12 @@ class WebSocketBot(threading.Thread):
             for channel in channels:
                 if channel.startswith("kline."):
                     interval = channel.split(".")[1]
-                    subs.add(f"{self.market}:kline.{interval}.{sym}")
+                    subs.add(f"kline.{interval}.{sym}")
                 elif channel.startswith("orderbook"):
                     depth = channel.split(".")[1] if "." in channel else cfg.ORDER_BOOK_DEPTH
-                    subs.add(f"{self.market}:orderbook.{depth}.{sym}")
+                    subs.add(f"orderbook.{depth}.{sym}")
                 elif channel == "trade":
-                    subs.add(f"{self.market}:publicTrade.{sym}")
+                    subs.add(f"publicTrade.{sym}")
         return subs
 
     def _change_market(self, new_market):
@@ -252,6 +263,13 @@ class WebSocketBot(threading.Thread):
             elif "publicTrade" in topic:
                 _, symbol = topic.split(".")
                 self.logger.debug("TRADE → %s", symbol)
+
+            # Add debugging for SEQ GAP warning
+            if "orderbook" in topic and "seq_gap" in data.get("type", "").lower():
+                symbol = data.get("symbol", "?")
+                last_seq = data.get("last_seq", "?")
+                new_seq = data.get("new_seq", "?")
+                self.logger.debug(f"[DEBUG][SEQ GAP] symbol={symbol} last_seq={last_seq} new_seq={new_seq} raw={raw[:200]}")
 
             # Routing (unchanged)
             if "publicTrade" in topic:

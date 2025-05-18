@@ -5,17 +5,18 @@ from bots.utils.logger import setup_logger
 
 class SubscriptionHandler(threading.Thread):
 
-    def __init__(self, redis_conn, out_q, log_level=logging.INFO):
+    def __init__(self, redis_conn, out_q, subscription_channel, log_level=logging.INFO):
         super().__init__(daemon=True)
         self.redis = redis_conn
         self.out_q = out_q
+        self.subscription_channel = subscription_channel
         self.logger = setup_logger("subscription_handler.log", log_level)
         self.running = True
 
     def run(self):
-        self.logger.info(f"Listening on Redis list '{cfg.SUBSCRIPTION_CHANNEL}' …")
+        self.logger.info(f"Listening on Redis list '{self.subscription_channel}' …")
         while self.running:
-            _key, raw = self.redis.blpop(cfg.SUBSCRIPTION_CHANNEL)
+            _key, raw = self.redis.blpop(self.subscription_channel)
             try:
                 cmd = json.loads(raw)
                 cmd = self._normalize(cmd)

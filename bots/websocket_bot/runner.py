@@ -1,4 +1,5 @@
-import signal, sys, os
+import sys
+import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from bots.websocket_bot.ws_core import WebSocketBot
@@ -15,19 +16,17 @@ def main():
     linear_bot.start()
     spot_bot.start()
 
-    # handle Ctrl+C properly for both bots
-    def handle_sigint(sig, frame):
+    try:
+        while linear_bot.is_alive() or spot_bot.is_alive():
+            linear_bot.join(timeout=1)
+            spot_bot.join(timeout=1)
+    except KeyboardInterrupt:
+        print("Stopping bots...")
         linear_bot.stop()
         spot_bot.stop()
         linear_bot.join()
         spot_bot.join()
         print("✅ Bots stopped gracefully.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    linear_bot.join()
-    spot_bot.join()
 
 if __name__ == "__main__":
     main()

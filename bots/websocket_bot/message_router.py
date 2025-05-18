@@ -16,10 +16,11 @@ class MessageRouter:
     """
     def __init__(self, redis_client, market):
         # ==== Jericho: Core State ====
+        log_level = logging.DEBUG if getattr(r_cfg, "LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
         self.redis = redis_client
         self.market = market  # 'linear' or 'spot'
         # Log file per market, not .py file
-        self.logger = setup_logger(f"router_{market}.log", logging.DEBUG)
+        self.logger = setup_logger(f"router_{market}.log", log_level)
         self._orderbooks = defaultdict(lambda: {"bids": [], "asks": []})
         self._last_seq = defaultdict(int)
         self._last_snapshot = defaultdict(lambda: time.time())
@@ -38,6 +39,7 @@ class MessageRouter:
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
             self.redis.publish(channel, json.dumps(trade_data))
+            self.logger.debug(f"Published trade: {trade_data}")
         except Exception as exc:
             self.logger.error(f"trade() parse error: {exc}  RAW={data}")
 
@@ -63,7 +65,7 @@ class MessageRouter:
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"]
             self.redis.publish(channel, json.dumps(out))
-            self.logger.debug(f"KLINE → {sym} {interval}")
+            self.logger.debug(f"Published kline: {out}")
         except Exception as exc:
             self.logger.error(f"kline() parse error: {exc}  RAW={msg}")
 
@@ -109,7 +111,7 @@ class MessageRouter:
                 }
                 self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_out"], json.dumps(aggregated_payload))
                 self._last_published_time[sym] = now
-                self.logger.debug("✅ Aggregated orderbook published for %s", sym)
+                self.logger.debug(f"Published orderbook: {aggregated_payload}")
         except Exception as exc:
             snippet = str(raw)[:120]
             self.logger.error("OB-parse error: %s raw:%s…", exc, snippet)

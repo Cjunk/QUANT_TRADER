@@ -7,7 +7,7 @@ import json, threading, queue, time, signal, datetime, logging
 import websocket
 import bots.websocket_bot.config_websocket_bot as cfg
 from bots.config import config_redis as r_cfg
-from bots.websocket_bot.subscription_handler import SubscriptionHandler
+from bots.websocket_bot.subscription_handler import SubscriptionHandler, MAX_SYMBOLS
 from bots.websocket_bot.message_router import MessageRouter
 from bots.websocket_bot.websocket_utils import send_webhook
 from bots.utils.logger import setup_logger
@@ -26,7 +26,9 @@ class WebSocketBot(threading.Thread):
         super().__init__(daemon=True)
         # ==== Jericho: Core State ====
         self.market = market
-        self.logger = setup_logger(f"{market}_ws_core.py", logging.INFO)
+        # Set up logger with correct log file and level
+        log_level = logging.DEBUG if getattr(cfg, "LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
+        self.logger = setup_logger(f"{market}_ws_core.log", log_level)
         self.redis = get_redis()
         self.cmd_q = queue.Queue()
         self.ws = None
@@ -58,6 +60,7 @@ class WebSocketBot(threading.Thread):
         while not self.exit_evt.is_set():
             try:
                 cmd = self.cmd_q.get(timeout=1)
+                self.logger.debug(f"Received command: {cmd}")
                 self._handle_command(cmd)
             except queue.Empty:
                 continue
@@ -71,7 +74,7 @@ class WebSocketBot(threading.Thread):
                 self.ws.close()
                 self.logger.info("🟢 WebSocket closed successfully.")
             except Exception as e:
-                self.logger.error(f"⚠️ WebSocket close failed: {e}")
+                self.logger.warning(f"⚠️ WebSocket close failed: {e}")
         if self.sub_handler: self.sub_handler.stop()
         self._save_subscriptions_to_redis()
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
@@ -112,6 +115,14 @@ class WebSocketBot(threading.Thread):
         market = cmd.get("market", "linear")
         symbols = cmd.get("symbols", [])
         channels = cmd.get("topics", ["trade", "orderbook", "kline.1", "kline.5", "kline.60", "kline.D"])
+        # Enforce symbol cap
+        if len(symbols) > MAX_SYMBOLS:
+            self.logger.warning(f"⚠️ Symbol limit ({MAX_SYMBOLS}) exceeded. Trimming extra symbols.")
+            symbols = symbols[:MAX_SYMBOLS]
+        # If invalid market, do not change subscriptions
+        if market not in cfg.WS_URL:
+            self.logger.error(f"⚠️ Invalid market type: {market}")
+            return
         if market != self.market:
             self.logger.info(f"🔄 Market change detected: {self.market} → {market}")
             self._change_market(market)
@@ -122,6 +133,7 @@ class WebSocketBot(threading.Thread):
             self.subscriptions |= new_subs
         elif action == "remove":
             self.subscriptions -= new_subs
+        self.logger.debug(f"Updated subscriptions: {self.subscriptions}")
         self._update_subscriptions()
 
     def _build_subscriptions(self, symbols, channels):
@@ -142,6 +154,10 @@ class WebSocketBot(threading.Thread):
         if new_market == self.market:
             self.logger.info(f"🔵 Market unchanged ({new_market}), no action taken.")
             return
+        # Invalid market check
+        if new_market not in cfg.WS_URL:
+            self.logger.error(f"⚠️ Invalid market type: {new_market}")
+            return  # Exit gracefully
         self.logger.info(f"🔄 Market change detected: {self.market} → {new_market}")
         if self.ws:
             try:
@@ -168,6 +184,7 @@ class WebSocketBot(threading.Thread):
             parts = sub.split(".")
             if len(parts) >= 3:
                 symbol = parts[2]
+                self.logger.debug(f"Resetting sequence for symbol: {symbol}")
                 self.router.reset_seq(symbol)
         # Jericho: Unsubscribe
         if to_unsub:

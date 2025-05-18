@@ -3,16 +3,21 @@ from bots.utils.redis_client import get_redis
 from bots.config import config_redis as cfg
 from bots.utils.logger import setup_logger
 
-class SubscriptionHandler(threading.Thread):
-    # ==== Jericho: Configurable Constants ====
-    MAX_SYMBOLS = 50  # Maximum allowed symbols per subscription
+# MAX_SYMBOLS is now the single source of truth for symbol limits, used by both SubscriptionHandler and WebSocketBot.
+MAX_SYMBOLS = 50  # Maximum allowed symbols per subscription
 
-    def __init__(self, redis_conn, out_q, subscription_channel, log_level=logging.INFO):
+def get_log_level():
+    # Use LOG_LEVEL from config if available, default to INFO
+    return logging.DEBUG if getattr(cfg, "LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
+
+class SubscriptionHandler(threading.Thread):
+    def __init__(self, redis_conn, out_q, subscription_channel, log_level=None):
         super().__init__(daemon=True)
         self.redis = redis_conn
         self.out_q = out_q
         self.subscription_channel = subscription_channel
-        self.logger = setup_logger("subscription_handler.log", log_level)
+        # Use config log level unless explicitly overridden
+        self.logger = setup_logger("subscription_handler.log", log_level or get_log_level())
         self.running = True
 
     def run(self):
@@ -23,8 +28,8 @@ class SubscriptionHandler(threading.Thread):
                 cmd = json.loads(raw)
                 cmd = self._normalize(cmd)
                 # ==== Jericho: Enforce symbol cap ====
-                if len(cmd.get("symbols", [])) > self.MAX_SYMBOLS:
-                    self.logger.warning(f"❌ Subscription rejected: too many symbols ({len(cmd['symbols'])} > {self.MAX_SYMBOLS})")
+                if len(cmd.get("symbols", [])) > MAX_SYMBOLS:
+                    self.logger.warning(f"❌ Subscription rejected: too many symbols ({len(cmd['symbols'])} > {MAX_SYMBOLS})")
                     continue
                 # ==== Jericho: Require OWNER field ====
                 if not cmd.get("owner"):

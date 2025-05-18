@@ -4,6 +4,8 @@ from bots.config import config_redis as cfg
 from bots.utils.logger import setup_logger
 
 class SubscriptionHandler(threading.Thread):
+    # ==== Jericho: Configurable Constants ====
+    MAX_SYMBOLS = 50  # Maximum allowed symbols per subscription
 
     def __init__(self, redis_conn, out_q, subscription_channel, log_level=logging.INFO):
         super().__init__(daemon=True)
@@ -20,6 +22,14 @@ class SubscriptionHandler(threading.Thread):
             try:
                 cmd = json.loads(raw)
                 cmd = self._normalize(cmd)
+                # ==== Jericho: Enforce symbol cap ====
+                if len(cmd.get("symbols", [])) > self.MAX_SYMBOLS:
+                    self.logger.warning(f"❌ Subscription rejected: too many symbols ({len(cmd['symbols'])} > {self.MAX_SYMBOLS})")
+                    continue
+                # ==== Jericho: Require OWNER field ====
+                if not cmd.get("owner"):
+                    self.logger.warning(f"❌ Subscription rejected: missing OWNER field. RAW: {cmd}")
+                    continue
                 self.out_q.put(cmd)
                 self.logger.debug(f"✅ Sent command to out_q: {cmd}")
             except Exception as exc:
@@ -32,10 +42,22 @@ class SubscriptionHandler(threading.Thread):
             cmd["symbols"] = [cmd["symbols"]]
         if "topics" not in cmd:
             cmd["topics"] = ["trade", "orderbook", "kline.1", "kline.5", "kline.60", "kline.D"]
+        # ==== Jericho: Normalize OWNER field ====
+        if "owner" not in cmd:
+            cmd["owner"] = None
         return cmd
 
     def stop(self):
         self.running = False
+
+    def remove_orderbook_subscriptions(self):
+        """
+        Remove all orderbook subscriptions from the queue or memory.
+        This function can be expanded to interact with the actual subscription state as needed.
+        """
+        # Example: If you store active subscriptions in memory, filter them here.
+        # This is a placeholder for future logic.
+        self.logger.info("Removing all orderbook subscriptions (functionality to be implemented as needed).")
 
 """
 subscription_message = {

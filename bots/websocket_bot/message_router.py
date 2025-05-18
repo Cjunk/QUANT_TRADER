@@ -5,78 +5,43 @@ from bots.config import config_redis as r_cfg
 from bots.websocket_bot.config_websocket_bot import ORDER_BOOK_DEPTH
 from bots.utils.logger import setup_logger
 
-# Global trackers
-_orderbooks          = defaultdict(lambda: {"bids": [], "asks": []})
-_last_seq            = defaultdict(int)
-_last_snapshot       = defaultdict(lambda: time.time())
-_last_published_time = defaultdict(lambda: 0)
-
+# ==== Jericho: Configurable Constants ====
 SNAPSHOT_REFRESH = 360           # seconds
 ORDERBOOK_AGG_INTERVAL = 60      # seconds
 
-def _extract_update_seq(msg: dict, symbol: str) -> int:
-    try:
-        return int(msg["data"]["u"])
-    except (KeyError, TypeError, ValueError):
-        logger = logging.getLogger("seq")
-        logger.warning("⚠️ using ts as seq for %s – adjust extractor!", symbol)
-        return int(msg.get("ts", 0))
-
-def _handle_snapshot(sym: str, msg: dict):
-    book = _orderbooks[sym]
-    ob = msg["data"]
-    book["bids"] = ob["b"]
-    book["asks"] = ob["a"]
-    _last_seq[sym] = _extract_update_seq(msg, sym)
-    _last_snapshot[sym] = time.time()
-
-def _apply_delta(sym: str, msg: dict):
-    book = _orderbooks[sym]
-    bids, asks = book["bids"], book["asks"]
-
-    for p, q in msg["data"]["b"]:
-        if float(q) == 0:
-            bids[:] = [lvl for lvl in bids if lvl[0] != p]
-        else:
-            for i, lvl in enumerate(bids):
-                if lvl[0] == p:
-                    bids[i] = [p, q]; break
-                if float(p) > float(lvl[0]):
-                    bids.insert(i, [p, q]); break
-            else:
-                bids.append([p, q])
-
-    for p, q in msg["data"]["a"]:
-        if float(q) == 0:
-            asks[:] = [lvl for lvl in asks if lvl[0] != p]
-        else:
-            for i, lvl in enumerate(asks):
-                if lvl[0] == p:
-                    asks[i] = [p, q]; break
-                if float(p) < float(lvl[0]):
-                    asks.insert(i, [p, q]); break
-            else:
-                asks.append([p, q])
-
 class MessageRouter:
+    """
+    Jericho: Professional, robust, and clear message router for WebSocket trading bots.
+    Handles trade, kline, and orderbook messages, with all state and logic encapsulated.
+    """
     def __init__(self, redis_client, market):
+        # ==== Jericho: Core State ====
         self.redis = redis_client
         self.market = market  # 'linear' or 'spot'
-        self.logger = setup_logger("router.py", logging.DEBUG)
+        # Log file per market, not .py file
+        self.logger = setup_logger(f"router_{market}.log", logging.DEBUG)
+        self._orderbooks = defaultdict(lambda: {"bids": [], "asks": []})
+        self._last_seq = defaultdict(int)
+        self._last_snapshot = defaultdict(lambda: time.time())
+        self._last_published_time = defaultdict(lambda: 0)
 
+    # ==== Jericho: Trade Message Handler ====
     def trade(self, data):
-        trade = data["data"][-1]
-        trade_data = {
-            "symbol": trade["s"],
-            "price": float(trade["p"]),
-            "volume": float(trade["v"]),
-            "side": trade["S"],
-            "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat()
-        }
-        channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
-        self.redis.publish(channel, json.dumps(trade_data))
+        try:
+            trade = data["data"][-1]
+            trade_data = {
+                "symbol": trade["s"],
+                "price": float(trade["p"]),
+                "volume": float(trade["v"]),
+                "side": trade["S"],
+                "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat()
+            }
+            channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
+            self.redis.publish(channel, json.dumps(trade_data))
+        except Exception as exc:
+            self.logger.error(f"trade() parse error: {exc}  RAW={data}")
 
-
+    # ==== Jericho: Kline Message Handler ====
     def kline(self, msg: dict):
         try:
             p_topic = msg["topic"].split(".")
@@ -97,48 +62,43 @@ class MessageRouter:
                 "confirmed": True
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"]
-            self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"], json.dumps(out))
+            self.redis.publish(channel, json.dumps(out))
             self.logger.debug(f"KLINE → {sym} {interval}")
         except Exception as exc:
             self.logger.error(f"kline() parse error: {exc}  RAW={msg}")
 
+    # ==== Jericho: Orderbook Message Handler ====
     def orderbook(self, raw: dict):
         try:
             sym = raw["data"]["s"]
             typ = raw["type"]
-            seq = _extract_update_seq(raw, sym)
+            seq = self._extract_update_seq(raw, sym)
 
-            # Handle snapshot
             if typ == "snapshot":
-                _handle_snapshot(sym, raw)
+                self._handle_snapshot(sym, raw)
                 self.logger.debug("📸 SNAPSHOT %s seq=%s", sym, seq)
-                _last_seq[sym] = seq
-
-            # Handle delta
+                self._last_seq[sym] = seq
             elif typ == "delta":
-                if _last_seq[sym] == 0:
+                if self._last_seq[sym] == 0:
                     self.logger.debug("🔄 Δ before snapshot for %s – requesting snapshot", sym)
                     return
-
-                if seq > _last_seq[sym] + 1:
-                    self.logger.warning("⚠️ SEQ GAP %s last=%s new=%s – requesting resync", sym, _last_seq[sym], seq)
+                if seq > self._last_seq[sym] + 1:
+                    self.logger.warning("⚠️ SEQ GAP %s last=%s new=%s – requesting resync", sym, self._last_seq[sym], seq)
                     return
+                self._apply_delta(sym, raw)
+                self._last_seq[sym] = seq
+                self._last_snapshot[sym] = time.time()
 
-                _apply_delta(sym, raw)
-                _last_seq[sym] = seq
-                _last_snapshot[sym] = time.time()
-
-            # Force snapshot refresh periodically
-            if time.time() - _last_snapshot[sym] > SNAPSHOT_REFRESH:
+            # Periodic snapshot refresh
+            if time.time() - self._last_snapshot[sym] > SNAPSHOT_REFRESH:
                 self.logger.debug("🔃 Forcing snapshot refresh for %s", sym)
-                _last_snapshot[sym] = time.time()
+                self._last_snapshot[sym] = time.time()
 
             # Aggregated publishing interval
             now = time.time()
-            if now - _last_published_time[sym] >= ORDERBOOK_AGG_INTERVAL:
-                bids = _orderbooks[sym]["bids"][:ORDER_BOOK_DEPTH]
-                asks = _orderbooks[sym]["asks"][:ORDER_BOOK_DEPTH]
-
+            if now - self._last_published_time[sym] >= ORDERBOOK_AGG_INTERVAL:
+                bids = self._orderbooks[sym]["bids"][:ORDER_BOOK_DEPTH]
+                asks = self._orderbooks[sym]["asks"][:ORDER_BOOK_DEPTH]
                 aggregated_payload = {
                     "symbol": sym,
                     "best_bid": bids[0] if bids else None,
@@ -147,15 +107,60 @@ class MessageRouter:
                     "asks": asks,
                     "timestamp": datetime.datetime.utcnow().isoformat()
                 }
-
                 self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_out"], json.dumps(aggregated_payload))
-                _last_published_time[sym] = now
+                self._last_published_time[sym] = now
                 self.logger.debug("✅ Aggregated orderbook published for %s", sym)
-
         except Exception as exc:
             snippet = str(raw)[:120]
             self.logger.error("OB-parse error: %s raw:%s…", exc, snippet)
 
+    # ==== Jericho: Sequence Reset ====
+    def reset_seq(self, symbol):
+        self._last_seq[symbol] = 0
+        self.logger.debug("🔄 Reset sequence for symbol: %s", symbol)
+
+    # ==== Jericho: Internal Helpers ====
+    def _extract_update_seq(self, msg: dict, symbol: str) -> int:
+        try:
+            return int(msg["data"]["u"])
+        except (KeyError, TypeError, ValueError):
+            logger = logging.getLogger("seq")
+            logger.warning("⚠️ using ts as seq for %s – adjust extractor!", symbol)
+            return int(msg.get("ts", 0))
+
+    def _handle_snapshot(self, sym: str, msg: dict):
+        book = self._orderbooks[sym]
+        ob = msg["data"]
+        book["bids"] = ob["b"]
+        book["asks"] = ob["a"]
+        self._last_seq[sym] = self._extract_update_seq(msg, sym)
+        self._last_snapshot[sym] = time.time()
+
+    def _apply_delta(self, sym: str, msg: dict):
+        book = self._orderbooks[sym]
+        bids, asks = book["bids"], book["asks"]
+        for p, q in msg["data"]["b"]:
+            if float(q) == 0:
+                bids[:] = [lvl for lvl in bids if lvl[0] != p]
+            else:
+                for i, lvl in enumerate(bids):
+                    if lvl[0] == p:
+                        bids[i] = [p, q]; break
+                    if float(p) > float(lvl[0]):
+                        bids.insert(i, [p, q]); break
+                else:
+                    bids.append([p, q])
+        for p, q in msg["data"]["a"]:
+            if float(q) == 0:
+                asks[:] = [lvl for lvl in asks if lvl[0] != p]
+            else:
+                for i, lvl in enumerate(asks):
+                    if lvl[0] == p:
+                        asks[i] = [p, q]; break
+                    if float(p) < float(lvl[0]):
+                        asks.insert(i, [p, q]); break
+                else:
+                    asks.append([p, q])
 
 
 

@@ -7,6 +7,43 @@ r.delete("spot_subscriptions")
 #Clearing the most recent subscriptions
 r.delete("most_recent_subscriptions:linear")
 r.delete("most_recent_subscriptions:spot")
+r.delete("spot_coin_subscriptions", "linear_coin_subscriptions", "most_recent_subscriptions:spot", "most_recent_subscriptions:linear")
+
 #Listing the number of 'memebers' in a variable
 r.smembers("spot_coin_subscriptions")
 r.smembers("linear_coin_subscriptions")
+
+#linear test
+r.lpush("linear_coin_subscriptions", json.dumps({"action": "set", "market":"linear","symbols": ["BTCUSDT"], "topics": ["kline.1", "orderbook.200", "trade"]}))
+
+r.lpush("linear_coin_subscriptions", json.dumps({
+    "action": "set",
+    "symbols": [],
+    "topics": [],
+    "market": "spot"
+}))
+
+
+# SUBSCRIPTIONS
+r.lpush("spot_coin_subscriptions", json.dumps({
+    "action": "set",
+    "symbols": [],
+    "market": "spot",
+    "topics": [],
+    "owner": "test_owner"
+}))
+coins = ["XRPUSDT", "LTCUSDT", "DOTUSDT", "BNBUSDT", "AVAXUSDT", "ATOMUSDT"]
+for coin in coins:
+    r.lpush("linear_coin_subscriptions", json.dumps({
+        "action": "add",
+        "symbols": [coin],
+        "market": "linear",
+        "topics": ["kline.1", "orderbook", "trade"]
+    }))
+r.lpush("linear_coin_subscriptions", json.dumps({
+    "action": "set",
+    "symbols": ["BTCUSDT"],
+    "topics": ["kline.1", "kline.5", "orderbook.200", "trade"],
+    "market": "linear",
+    "owner": "test_owner"
+}))

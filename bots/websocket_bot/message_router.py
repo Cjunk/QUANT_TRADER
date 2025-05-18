@@ -65,6 +65,7 @@ class MessageRouter:
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"]
             self.redis.publish(channel, json.dumps(out))
+            self.logger.info(f"KLINE {interval} → {sym} {interval}")
             self.logger.debug(f"Published kline: {out}")
         except Exception as exc:
             self.logger.error(f"kline() parse error: {exc}  RAW={msg}")

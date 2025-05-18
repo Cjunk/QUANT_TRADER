@@ -266,6 +266,7 @@ class WebSocketBot(threading.Thread):
             topic = data.get("topic", "")
             if "kline" in topic:
                 _, interval, symbol = topic.split(".")
+                # Only log at debug here; info-level log will be in MessageRouter.kline for confirmed klines
                 self.logger.debug(f"KLINE → {symbol} {interval}")
             elif "orderbook" in topic:
                 _, depth, symbol = topic.split(".")

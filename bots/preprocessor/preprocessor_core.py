@@ -27,7 +27,7 @@ class PreprocessorBot:
         self.auth_token = BOT_AUTH_TOKEN
         self.running = True
         self.GlobalIndicators = GlobalIndicators()
-        self.kline_windows = {}   # {(symbol, interval): deque}
+        self.kline_windows = {}   # {(symbol, interval, market): deque}
         self.trade_windows = {}   # {(symbol, minute): [trades]}
     
     def _connect_redis(self):
@@ -35,7 +35,12 @@ class PreprocessorBot:
             host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
         )
         self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(KLINE_UPDATES, TRADE_CHANNEL, ORDER_BOOK_UPDATES)
+        # Subscribe to both spot and linear kline channels
+        self.pubsub.subscribe(
+            r_cfg.REDIS_CHANNEL["linear.kline_out"],
+            r_cfg.REDIS_CHANNEL["spot.kline_out"],
+            TRADE_CHANNEL, ORDER_BOOK_UPDATES
+        )
         self.logger.info("✅ Connected to Redis and subscribed to required channels.")
 
     def _register_bot(self):
@@ -93,27 +98,45 @@ class PreprocessorBot:
             time.sleep(1)
 
     def _route_message(self, channel, payload):
-        if channel == KLINE_UPDATES:
-            self._process_kline(payload)
+        # Route by channel for kline, trade, orderbook
+        if channel in (r_cfg.REDIS_CHANNEL["linear.kline_out"], r_cfg.REDIS_CHANNEL["spot.kline_out"]):
+            # Determine market from channel
+            market = "linear" if channel == r_cfg.REDIS_CHANNEL["linear.kline_out"] else "spot"
+            self._process_kline(payload, market)
         elif channel == TRADE_CHANNEL:
             self._process_trade(payload)
         elif channel == ORDER_BOOK_UPDATES:
             self._process_orderbook(payload)
 
-    def _process_kline(self, payload):
+    def _preload_kline_window(self, symbol, interval, market):
+        """
+        Preload kline window from Redis. If empty, ready to request from database bot.
+        Returns True if window was loaded from Redis, False if needs DB fetch.
+        """
+        key = (symbol, interval, market)
+        redis_key = f"kline_window:{market}:{symbol}:{interval}"
+        self.kline_windows[key] = deque(maxlen=WINDOW_SIZE)
+        items = self.redis_client.lrange(redis_key, -WINDOW_SIZE, -1)
+        if items:
+            for item in items:
+                self.kline_windows[key].append(json.loads(item))
+            return True
+        else:
+            self.logger.info(f"No Redis window for {market}.{symbol}.{interval}. Ready to request from DB if needed.")
+            return False
+
+    def _process_kline(self, payload, market):
         symbol, interval = payload['symbol'], payload['interval']
-        key = (symbol, interval)
-        redis_key = f"kline_window:{symbol}:{interval}"
+        key = (symbol, interval, market)
+        redis_key = f"kline_window:{market}:{symbol}:{interval}"
 
         if key not in self.kline_windows:
-            self.kline_windows[key] = deque(maxlen=WINDOW_SIZE)
-            for item in self.redis_client.lrange(redis_key, -WINDOW_SIZE, -1):
-                self.kline_windows[key].append(json.loads(item))
+            self._preload_kline_window(symbol, interval, market)
 
         if self.kline_windows[key]:
             last = self.kline_windows[key][-1]
             if last['start_time'] == payload['start_time'] and last['close'] == payload['close']:
-                self.logger.debug("🔁 Duplicate kline detected. Skipping.")
+                self.logger.debug(f"🔁 Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
                 return
 
         self.kline_windows[key].append(payload)
@@ -126,9 +149,14 @@ class PreprocessorBot:
             enriched_df = self.GlobalIndicators.compute_indicators(df.copy())
             enriched_kline = enriched_df.iloc[-1].to_dict()
             enriched_kline['start_time'] = df.iloc[-1]['start_time']
-            self.redis_client.publish(PRE_PROC_KLINE_UPDATES, json.dumps(enriched_kline))
+            # Publish to the correct processed channel for the market
+            if market == "linear":
+                out_channel = PRE_PROC_KLINE_UPDATES + ":linear"
+            else:
+                out_channel = PRE_PROC_KLINE_UPDATES + ":spot"
+            self.redis_client.publish(out_channel, json.dumps(enriched_kline))
         except Exception as e:
-            self.logger.error(f"❌ Error processing kline: {e}")
+            self.logger.error(f"❌ Error processing kline for {market}: {e}")
 
     def _process_trade(self, payload):
         try:

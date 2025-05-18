@@ -1,0 +1,13 @@
+{
+  "name": "quant-trading",
+  "version": "1.0.0",
+  "scripts": {
+    "wsbot": "venv/Scripts/python -m bots.websocket_bot.runner",
+    "dbbot": "venv/Scripts/python -m bots.db_bot.runner",
+    "listener": "venv/Scripts/python listener.py",
+    "all": "npm-run-all --parallel wsbot dbbot listener"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5"
+  }
+}

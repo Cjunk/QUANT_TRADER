@@ -34,16 +34,20 @@ r.lpush("spot_coin_subscriptions", json.dumps({
 }))
 coins = ["XRPUSDT", "LTCUSDT", "DOTUSDT", "BNBUSDT", "AVAXUSDT", "ATOMUSDT"]
 for coin in coins:
-    r.lpush("linear_coin_subscriptions", json.dumps({
-        "action": "add",
-        "symbols": [coin],
-        "market": "linear",
-        "topics": ["kline.1", "orderbook", "trade"]
-    }))
-r.lpush("linear_coin_subscriptions", json.dumps({
+
+
+r.lpush("spot_coin_subscriptions", json.dumps({
     "action": "set",
     "symbols": ["BTCUSDT"],
-    "topics": ["kline.1", "kline.5", "orderbook.200", "trade"],
-    "market": "linear",
+    "topics": ["kline.1", "kline.5"],
+    "market": "spot",
+    "owner": "test_owner"
+}))
+
+r.lpush("spot_coin_subscriptions", json.dumps({
+    "action": "set",
+    "symbols": [],
+    "topics": ["trade"],
+    "market": "spot",
     "owner": "test_owner"
 }))

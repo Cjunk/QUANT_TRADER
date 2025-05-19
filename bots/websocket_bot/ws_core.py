@@ -7,6 +7,7 @@ import json, threading, queue, time, signal, datetime, logging
 import websocket
 import bots.websocket_bot.config_websocket_bot as cfg
 from bots.config import config_redis as r_cfg
+from bots.config import config_common as common_cfg
 from bots.websocket_bot.subscription_handler import SubscriptionHandler, MAX_SYMBOLS
 from bots.websocket_bot.message_router import MessageRouter
 from bots.websocket_bot.websocket_utils import send_webhook
@@ -251,13 +252,13 @@ class WebSocketBot(threading.Thread):
 
     def _heartbeat(self):
         while not self.exit_evt.is_set():
-            self.redis.publish(r_cfg.HEARTBEAT_CHANNEL, json.dumps({
+            self.redis.publish(common_cfg.HEARTBEAT_CHANNEL, json.dumps({
                 "bot_name": cfg.BOT_NAME,
                 "heartbeat": True,
                 "time": datetime.datetime.utcnow().isoformat(),
                 "auth_token": cfg.BOT_AUTH_TOKEN
             }))
-            self.exit_evt.wait(cfg.HEARTBEAT_INTERVAL)
+            self.exit_evt.wait(common_cfg.HEARTBEAT_INTERVAL_SECONDS)
 
     # ==== Jericho: WebSocket Message Handler ====
     def _on_message(self, _ws, raw: str):

@@ -35,6 +35,7 @@ import psycopg2.extras
 import config.config_db as db_config
 import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
+from config.config_common import HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TIMEOUT_SECONDS
 from wallet_balance import store_wallet_balances
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
@@ -42,46 +43,53 @@ from psycopg2.extensions import register_adapter, AsIs
 if os.name == 'nt':
     sys.stdout.reconfigure(encoding='utf-8')
 
-INTERVAL_MAP = {"1": 1, "5": 5, "60": 60, "D": 1440}
 class PostgresDBBot:
-    
+    # === Class-level constants and variables ===
+    INTERVAL_MAP = {"1": 1, "5": 5, "60": 60, "D": 1440}
+    # HEARTBEAT_TIMEOUT_SECONDS and HEARTBEAT_INTERVAL_SECONDS are now imported from config_common
+
     def __init__(self, log_filename=db_config.LOG_FILENAME):
-        # Logger
-        self.logger = setup_logger(db_config.LOG_FILENAME,getattr(logging, db_config.LOG_LEVEL.upper(), logging.WARNING)) # Set up logger and retrieve the logger type from config 
-        self.logger.info("Initializing PostgresDBBot...")                
-        #self.GlobalIndicators = GlobalIndicators() # TODO possible to delete
+        # === All instance variables at the top ===
+        self.logger = setup_logger(db_config.LOG_FILENAME, getattr(logging, db_config.LOG_LEVEL.upper(), logging.WARNING))
         self.host = db_config.DB_HOST
         self.port = db_config.DB_PORT
+        self.database = db_config.DB_DATABASE
         self.trade_buffer = []
         self.status = {
-                        "bot_name": db_config.BOT_NAME,
-                        "status": "started",
-                        "time": datetime.datetime.utcnow().isoformat(),
-                        "auth_token": db_config.BOT_AUTH_TOKEN,  # each bot has its own
-                        "metadata": {
-                            "version": "1.2.0",
-                            "pid": os.getpid(),
-                            "strategy": "VWAP"
-                        }
-                    }
-
-        self.database = db_config.DB_DATABASE
-        # ✅ Use SQLAlchemy to create a database engine
+            "bot_name": db_config.BOT_NAME,
+            "status": "started",
+            "time": datetime.datetime.utcnow().isoformat(),
+            "auth_token": db_config.BOT_AUTH_TOKEN,
+            "metadata": {
+                "version": "1.2.0",
+                "pid": os.getpid(),
+                "strategy": "VWAP"
+            }
+        }
         self.db_engine = create_engine(
             f"postgresql://{db_config.DB_USER}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
         )
+        self.conn = None
+        self.redis_client = None
+        self.pubsub = None
+        self.running = True
+        self.subscribed_channels = set()
+        self.bot_status = {}
+        self.heartbeat_timeout = HEARTBEAT_TIMEOUT_SECONDS
+        self.heartbeat_interval = HEARTBEAT_INTERVAL_SECONDS
+
+        self.logger.info("Initializing PostgresDBBot...")
         print("Database Bot (Postgresql) is running .......")
         self._setup_postgres()
         self._setup_redis()
-        # Control flag for run loop
-        self.running = True
+        # === Bot status/liveness logic FIRST ===
+        self.bot_status = self._load_initial_bot_status()
+        self._start_heartbeat_listener()
+        self._start_self_heartbeat()
+        # === Only now start periodic/gap/archive tasks ===
         self._start_archive_scheduler()
-        self._start_heartbeat_listener()  
         threading.Thread(target=self._flush_trade_buffer, daemon=True).start()
-        self._start_self_heartbeat()      
         self._start_gap_check()
-        self.subscribed_channels = set()  # ✅ Track active websocket topics
-
 
     """
     =-=-=-=-=-=-=- Internal Bot operational functions
@@ -107,9 +115,6 @@ class PostgresDBBot:
         threading.Thread(target=periodic_gap_check, daemon=True).start()
      #   -----POSTGRESQL SETUP
     def _setup_postgres(self):
-        self.db_engine = create_engine(
-            f"postgresql://{db_config.DB_USER}:{db_config.DB_PASSWORD}@{self.host}:{self.port}/{self.database}"
-        )
         self.conn = psycopg2.connect(
             host=self.host,
             port=self.port,
@@ -138,7 +143,6 @@ class PostgresDBBot:
             except redis.ConnectionError:
                 self.logger.warning("Redis unavailable, retrying in 5 seconds...")
                 time.sleep(5)
-
         self.pubsub = self.redis_client.pubsub()
         self.pubsub.subscribe(
             config_redis.COIN_CHANNEL,
@@ -147,27 +151,11 @@ class PostgresDBBot:
             config_redis.PRE_PROC_ORDER_BOOK_UPDATES,
             config_redis.RESYNC_CHANNEL,
             config_redis.SERVICE_STATUS_CHANNEL,
-            config_redis.MACRO_METRICS_CHANNEL,  
-            config_redis.REQUEST_COINS  # Used by websocket to indicate it needs coins. 
+            config_redis.MACRO_METRICS_CHANNEL,
+            config_redis.REQUEST_COINS
         )
         self.logger.info("Subscribed to Redis Pub/Sub channels.")
-    def _connect_to_redis(self):
-        while True:
-            try:
-                client = redis.Redis(
-                    host=config_redis.REDIS_HOST,
-                    port=config_redis.REDIS_PORT,
-                    db=config_redis.REDIS_DB,
-                    decode_responses=True,
-                    socket_keepalive=True,
-                    retry_on_timeout=True
-                )
-                client.ping()  # Check if Redis is responsive
-                return client
-            except redis.ConnectionError:
-                print("Redis connection failed. Retrying in 5 seconds...")
-                time.sleep(5)    
- 
+
     def _listen_to_redis(self):
         self.logger.info("🧠 Redis listener thread started.")
         while self.running:
@@ -226,13 +214,34 @@ class PostgresDBBot:
     def stop(self):
         """Stop the run loop and close DB connection."""
         self.running = False
-        self.status["status"] = "stopped"
-        self.status["time"] = datetime.datetime.utcnow().isoformat()    
-        self.handle_bot_status_update(self.status)
-        self.pubsub.close()
-        if self.conn:
-            self.conn.close()
-        self.logger.info("DB Bot Stopped.")   
+        # Send stopped status update before shutting down
+        stopped_status = {
+            "bot_name": db_config.BOT_NAME,
+            "status": "stopped",
+            "time": datetime.datetime.utcnow().isoformat(),
+            "auth_token": db_config.BOT_AUTH_TOKEN,
+            "metadata": {
+                "version": "1.2.0",
+                "pid": os.getpid(),
+                "strategy": "VWAP"
+            }
+        }
+        try:
+            self.logger.info("Sending stopped status update to DB...")
+            self.handle_bot_status_update(stopped_status)
+        except Exception as e:
+            self.logger.error(f"Failed to update stopped status in DB: {e}")
+        try:
+            if self.pubsub:
+                self.pubsub.close()
+        except Exception as e:
+            self.logger.error(f"Error closing Redis pubsub: {e}")
+        try:
+            if self.conn:
+                self.conn.close()
+        except Exception as e:
+            self.logger.error(f"Error closing DB connection: {e}")
+        self.logger.info("DB Bot Stopped.")
     def _start_archive_scheduler(self):
         def scheduler():
             while self.running:
@@ -250,13 +259,14 @@ class PostgresDBBot:
                     payload = {
                         "bot_name": db_config.BOT_NAME,
                         "heartbeat": True,
-                        "time": datetime.datetime.utcnow().isoformat()
+                        "time": datetime.datetime.utcnow().isoformat(),
+                        "auth_token": db_config.BOT_AUTH_TOKEN
                     }
                     self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
                     self.logger.debug("Self-heartbeat sent.")
                 except Exception as e:
                     self.logger.warning(f"Failed to send self-heartbeat: {e}")
-                time.sleep(60)
+                time.sleep(self.heartbeat_interval)
 
         threading.Thread(target=self_heartbeat, daemon=True).start()    
     """
@@ -292,12 +302,16 @@ class PostgresDBBot:
             cursor.close()
             return
 
-        if row[0] != hashed_auth_token:
+        db_token = row[0]
+        if db_token != hashed_auth_token:
             self.logger.warning(f"❌ Invalid auth token for bot '{bot_name}'")
+            print(f"[AUTH DEBUG]\n  Raw config token: {auth_token!r}\n  Computed hash:   {hashed_auth_token}\n  DB value:        {db_token}")
+            self.logger.debug(f"Auth debug: computed hash={hashed_auth_token}, db value={db_token}, raw config token={auth_token!r}")
             cursor.close()
             return
 
-        self.logger.info(f"🔐 Authenticated bot '{bot_name}'")
+        self.logger.info(f"🔐 Authenticated bot '{bot_name}' (hash={hashed_auth_token})")
+        print(f"[AUTH DEBUG] AUTH SUCCESS\n  Raw config token: {auth_token!r}\n  Computed hash:   {hashed_auth_token}\n  DB value:        {db_token}")
 
         # 🔄 Check if bot exists in bots table
         cursor.execute(f"""
@@ -323,9 +337,9 @@ class PostgresDBBot:
         cursor.close()
 
         # Special case for websocket bot
-        if bot_name == "websocket_bot" and status == "started":
-            self.logger.info("🌐 WebSocket bot started – publishing current coin list.")
-            self._publish_current_coin_list()
+        # if bot_name == "websocket_bot" and status == "started":
+        #     self.logger.info("🌐 WebSocket bot started – publishing current coin list.")
+        #     self._publish_current_coin_list()
     def get_thresholds(self):
         """
         Retrieve large trade thresholds from the database.
@@ -501,18 +515,54 @@ class PostgresDBBot:
 
             while self.running:
                 message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                now = datetime.datetime.utcnow()
                 if message and message["type"] == "message":
                     try:
                         payload = json.loads(message["data"])
                         bot_name = payload.get("bot_name")
                         timestamp = payload.get("time")
+                        # If this is a new bot, add to bot_status and update DB to started
                         if bot_name and timestamp:
+                            if bot_name not in self.bot_status or self.bot_status[bot_name]['status'] == 'stopped':
+                                # Compose a status update object using payload fields
+                                status_obj = {
+                                    "bot_name": bot_name,
+                                    "status": "started",
+                                    "time": timestamp,
+                                    "auth_token": payload.get("auth_token", ""),
+                                    "metadata": payload.get("metadata", {})
+                                }
+                                self.handle_bot_status_update(status_obj)
                             self._update_bot_last_seen(bot_name, timestamp)
+                            self.bot_status[bot_name] = {'last_seen': now, 'status': 'started'}
                     except Exception as e:
                         self.logger.error(f"Failed to handle heartbeat message: {e}")
+                # Check for missed heartbeats for all bots in self.bot_status
+                for bot, info in list(self.bot_status.items()):
+                    last_seen = info['last_seen']
+                    if not last_seen or (now - last_seen).total_seconds() > self.heartbeat_timeout:
+                        if info['status'] != 'stopped':
+                            self.logger.warning(f"No heartbeat from {bot} for over {self.heartbeat_timeout} seconds. Marking as stopped.")
+                            self._mark_bot_stopped(bot, now)
+                            self.bot_status[bot]['status'] = 'stopped'
                 time.sleep(0.5)
 
         threading.Thread(target=listen_heartbeat, daemon=True).start()   
+    def _mark_bot_stopped(self, bot_name, timestamp):
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"""
+                UPDATE {db_config.DB_TRADING_SCHEMA}.bots
+                SET status = %s, last_updated = %s
+                WHERE bot_name = %s
+            """, ("stopped", timestamp, bot_name))
+            self.conn.commit()
+            self.logger.info(f"🔴 Marked {bot_name} as stopped in DB at {timestamp}")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Failed to mark {bot_name} as stopped: {e}")
+        finally:
+            cursor.close()
     def _archive_kline_data(self):
         timestamp = datetime.datetime.now(pytz.timezone("Australia/Sydney")).strftime("%Y%m%d_%H%M%S")
 
@@ -748,7 +798,7 @@ class PostgresDBBot:
         cursor = self.conn.cursor()
         try:
             self.logger.info(f"Checking gaps in {symbol}-{interval}")
-            interval_minutes = INTERVAL_MAP.get(interval)
+            interval_minutes = self.INTERVAL_MAP.get(interval)
             if interval_minutes is None:
                 self.logger.error(f"Unsupported interval: {interval}")
                 return
@@ -906,6 +956,23 @@ class PostgresDBBot:
             self.logger.error(f"Inserting klines failed: {e}")
         finally:
             cursor.close()
+
+    def _load_initial_bot_status(self):
+        """
+        Load all bots from the bots table and initialize their status as 'stopped' with last_seen=None.
+        """
+        status = {}
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(f"SELECT bot_name, status, last_updated FROM {db_config.DB_TRADING_SCHEMA}.bots")
+            for bot_name, db_status, last_updated in cursor.fetchall():
+                last_seen = last_updated if last_updated else None
+                status[bot_name] = {'last_seen': last_seen, 'status': db_status or 'stopped'}
+        except Exception as e:
+            self.logger.error(f"Failed to load initial bot status: {e}")
+        finally:
+            cursor.close()
+        return status
 
 
 

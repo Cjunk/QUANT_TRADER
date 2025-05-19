@@ -10,7 +10,8 @@ ps = r.pubsub()
 channels = [
     #config_redis.SERVICE_STATUS_CHANNEL,
     #config_redis.WALLET_SYNC_CHANNEL,
-    #config_redis.KLINE_UPDATES,
+    config_redis.REDIS_CHANNEL["spot.kline_out"],
+    config_redis.REDIS_CHANNEL["linear.kline_out"],
     #config_redis.PRE_PROC_TRADE_CHANNEL,
     #config_redis.ORDER_BOOK_UPDATES,
     #config_redis.TRADE_CHANNEL,
@@ -21,8 +22,8 @@ channels = [
     #config_redis.KLINE_QUEUE_CHANNEL,
     #config_redis.HEARTBEAT_CHANNEL,
     #"current_coins",
-    config_redis.REDIS_CHANNEL["spot.trade_out"],
-    config_redis.REDIS_CHANNEL["linear.trade_out"]
+    #config_redis.REDIS_CHANNEL["spot.trade_out"],
+    #config_redis.REDIS_CHANNEL["linear.trade_out"]
 ]
 ps.subscribe(*channels)
 
@@ -34,7 +35,11 @@ try:
         if message and message["type"] == "message":
             channel = message["channel"]
             # Determine market from channel name
-            if channel == config_redis.REDIS_CHANNEL["spot.trade_out"]:
+            if channel == config_redis.REDIS_CHANNEL["spot.kline_out"]:
+                market = "spot"
+            elif channel == config_redis.REDIS_CHANNEL["linear.kline_out"]:
+                market = "linear"
+            elif channel == config_redis.REDIS_CHANNEL["spot.trade_out"]:
                 market = "spot"
             elif channel == config_redis.REDIS_CHANNEL["linear.trade_out"]:
                 market = "linear"

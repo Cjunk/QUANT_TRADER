@@ -8,7 +8,7 @@ from bots.config import config_redis as r_cfg
 from bots.config.config_redis import REDIS_CHANNEL
 from bots.config.config_redis import ORDER_BOOK_UPDATES
 from bots.utils.redis_client import get_redis
-from bots.config.config_redis import HEARTBEAT_CHANNEL
+from bots.config.config_common import HEARTBEAT_CHANNEL
 import logging
 
 # Define the correct Redis channel keys for your environment

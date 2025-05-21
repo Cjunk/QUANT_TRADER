@@ -42,7 +42,8 @@ class WebSocketBot(threading.Thread):
         # ==== Jericho: Market-specific Redis channel ====
         subscription_channel = {
             "spot": r_cfg.SPOT_SUBSCRIPTION_CHANNEL,
-            "linear": r_cfg.LINEAR_SUBSCRIPTION_CHANNEL
+            "linear": r_cfg.LINEAR_SUBSCRIPTION_CHANNEL,
+            "derivatives": r_cfg.DERIVATIVES_SUBSCRIPTION_CHANNEL if hasattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL') else None
         }.get(self.market, r_cfg.SPOT_SUBSCRIPTION_CHANNEL)
         self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q, subscription_channel=subscription_channel)
         self.sub_handler.start()
@@ -106,9 +107,9 @@ class WebSocketBot(threading.Thread):
 
     def log_current_subscriptions(self):
         if self.subscriptions:
-            self.logger.info(f"📡 Current subscriptions ({len(self.subscriptions)}): {', '.join(sorted(self.subscriptions))}")
+            self.logger.info(f"📡 [{self.market.upper()}] Current subscriptions ({len(self.subscriptions)}): {', '.join(sorted(self.subscriptions))}")
         else:
-            self.logger.info("📡 No active subscriptions.")
+            self.logger.info(f"📡 [{self.market.upper()}] No active subscriptions.")
 
     # ==== Jericho: Command Handling ====
     def _handle_command(self, cmd):
@@ -209,7 +210,7 @@ class WebSocketBot(threading.Thread):
 
     # ==== Jericho: WebSocket Connection ====
     def _connect_ws(self):
-        url = cfg.WS_URL[self.market]
+        url = cfg.WS_URL[self.market] if self.market in cfg.WS_URL else cfg.WS_URL["spot"]
         def _runner():
             while not self.exit_evt.is_set():
                 self.ws = websocket.WebSocketApp(
@@ -251,13 +252,23 @@ class WebSocketBot(threading.Thread):
             self.exit_evt.wait(5)
 
     def _heartbeat(self):
+        kline_count = getattr(self, "kline_count", 0)
         while not self.exit_evt.is_set():
-            self.redis.publish(common_cfg.HEARTBEAT_CHANNEL, json.dumps({
+            # Prepare vital info
+            vital_info = {
+                "market": self.market,
+                "subscriptions": sorted(list(self.subscriptions)),
+                "kline_count": kline_count,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+            }
+            payload = {
                 "bot_name": cfg.BOT_NAME,
                 "heartbeat": True,
                 "time": datetime.datetime.utcnow().isoformat(),
-                "auth_token": cfg.BOT_AUTH_TOKEN
-            }))
+                "auth_token": cfg.BOT_AUTH_TOKEN,
+                "vitals": vital_info
+            }
+            self.redis.publish(common_cfg.HEARTBEAT_CHANNEL, json.dumps(payload))
             self.exit_evt.wait(common_cfg.HEARTBEAT_INTERVAL_SECONDS)
 
     # ==== Jericho: WebSocket Message Handler ====
@@ -268,13 +279,17 @@ class WebSocketBot(threading.Thread):
             if "kline" in topic:
                 _, interval, symbol = topic.split(".")
                 # Only log at debug here; info-level log will be in MessageRouter.kline for confirmed klines
-                self.logger.debug(f"KLINE → {symbol} {interval}")
+                self.logger.debug(f"KLINE  {symbol} {interval}")
+                # --- Kline counter ---
+                if not hasattr(self, "kline_count"):
+                    self.kline_count = 0
+                self.kline_count += 1
             elif "orderbook" in topic:
                 _, depth, symbol = topic.split(".")
-                self.logger.debug(f"ORDERBOOK → {symbol} depth {depth}")
+                self.logger.debug(f"ORDERBOOK  {symbol} depth {depth}")
             elif "publicTrade" in topic:
                 _, symbol = topic.split(".")
-                self.logger.debug(f"TRADE → {symbol}")
+                self.logger.debug(f"TRADE  {symbol}")
             # Jericho: SEQ GAP Debugging (remove when resolved)
             if "orderbook" in topic and "seq_gap" in data.get("type", "").lower():
                 symbol = data.get("symbol", "?")
@@ -289,7 +304,7 @@ class WebSocketBot(threading.Thread):
             elif "orderbook" in topic:
                 self.router.orderbook(data)
         except Exception as exc:
-            self.logger.error(f"Parse fail: {exc} – first 120 chars: {raw[:120]}…")
+            self.logger.error(f"Parse fail: {exc}  first 120 chars: {raw[:120]}")
 
 
 

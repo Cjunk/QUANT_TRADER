@@ -20,6 +20,8 @@ from config.config_auto_preprocessor_bot import (
     STRATEGY_NAME, VERSION, DESCRIPTION
 )
 
+from config.config_common import HEARTBEAT_INTERVAL_SECONDS
+
 class PreprocessorBot:
     def __init__(self, log_filename=LOG_FILENAME):
         self.logger = setup_logger(LOG_FILENAME, getattr(logging, LOG_LEVEL.upper(), logging.WARNING))
@@ -29,19 +31,22 @@ class PreprocessorBot:
         self.GlobalIndicators = GlobalIndicators()
         self.kline_windows = {}   # {(symbol, interval, market): deque}
         self.trade_windows = {}   # {(symbol, minute): [trades]}
-    
+        self.market_channels = {
+            "linear": r_cfg.REDIS_CHANNEL["linear.kline_out"],
+            "spot": r_cfg.REDIS_CHANNEL["spot.kline_out"],
+            # Add derivatives if available
+            "derivatives": r_cfg.REDIS_CHANNEL["derivatives.kline_out"] if "derivatives.kline_out" in r_cfg.REDIS_CHANNEL else None
+        }
+
     def _connect_redis(self):
         self.redis_client = redis.Redis(
             host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
         )
         self.pubsub = self.redis_client.pubsub()
-        # Subscribe to both spot and linear kline channels
-        self.pubsub.subscribe(
-            r_cfg.REDIS_CHANNEL["linear.kline_out"],
-            r_cfg.REDIS_CHANNEL["spot.kline_out"],
-            TRADE_CHANNEL, ORDER_BOOK_UPDATES
-        )
-        self.logger.info("✅ Connected to Redis and subscribed to required channels.")
+        # Subscribe to all available kline channels
+        channels_to_sub = [ch for ch in self.market_channels.values() if ch]
+        self.pubsub.subscribe(*channels_to_sub, TRADE_CHANNEL, ORDER_BOOK_UPDATES)
+        self.logger.info(f"✅ Connected to Redis and subscribed to: {channels_to_sub + [TRADE_CHANNEL, ORDER_BOOK_UPDATES]}")
 
     def _register_bot(self):
         payload = {
@@ -75,7 +80,7 @@ class PreprocessorBot:
                 self.logger.debug("❤️ Sent heartbeat.")
             except Exception as e:
                 self.logger.warning(f"⚠️ Heartbeat failed: {e}")
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
     def _listen_redis(self):
         while self.running:
@@ -99,11 +104,11 @@ class PreprocessorBot:
 
     def _route_message(self, channel, payload):
         # Route by channel for kline, trade, orderbook
-        if channel in (r_cfg.REDIS_CHANNEL["linear.kline_out"], r_cfg.REDIS_CHANNEL["spot.kline_out"]):
-            # Determine market from channel
-            market = "linear" if channel == r_cfg.REDIS_CHANNEL["linear.kline_out"] else "spot"
-            self._process_kline(payload, market)
-        elif channel == TRADE_CHANNEL:
+        for market, ch in self.market_channels.items():
+            if ch and channel == ch:
+                self._process_kline(payload, market)
+                return
+        if channel == TRADE_CHANNEL:
             self._process_trade(payload)
         elif channel == ORDER_BOOK_UPDATES:
             self._process_orderbook(payload)
@@ -150,10 +155,7 @@ class PreprocessorBot:
             enriched_kline = enriched_df.iloc[-1].to_dict()
             enriched_kline['start_time'] = df.iloc[-1]['start_time']
             # Publish to the correct processed channel for the market
-            if market == "linear":
-                out_channel = PRE_PROC_KLINE_UPDATES + ":linear"
-            else:
-                out_channel = PRE_PROC_KLINE_UPDATES + ":spot"
+            out_channel = f"{PRE_PROC_KLINE_UPDATES}:{market}"
             self.redis_client.publish(out_channel, json.dumps(enriched_kline))
         except Exception as e:
             self.logger.error(f"❌ Error processing kline for {market}: {e}")

@@ -35,7 +35,7 @@ import psycopg2.extras
 import config.config_db as db_config
 import config.config_redis as config_redis
 import config.config_ws as ws_config  # If you store Redis host/port here or wherever
-from config.config_common import HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TIMEOUT_SECONDS
+from config.config_common import HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, HEARTBEAT_CHANNEL
 from wallet_balance import store_wallet_balances
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
@@ -262,7 +262,7 @@ class PostgresDBBot:
                         "time": datetime.datetime.utcnow().isoformat(),
                         "auth_token": db_config.BOT_AUTH_TOKEN
                     }
-                    self.redis_client.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
+                    self.redis_client.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
                     self.logger.debug("Self-heartbeat sent.")
                 except Exception as e:
                     self.logger.warning(f"Failed to send self-heartbeat: {e}")
@@ -511,7 +511,7 @@ class PostgresDBBot:
                 decode_responses=True
             )
             pubsub = heartbeat_client.pubsub()
-            pubsub.subscribe(config_redis.HEARTBEAT_CHANNEL)
+            pubsub.subscribe(HEARTBEAT_CHANNEL)
 
             while self.running:
                 message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1)

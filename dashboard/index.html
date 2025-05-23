@@ -44,6 +44,24 @@
         color: #f00;
         font-weight: bold;
       }
+
+      .vitals-inline {
+        background: #222;
+        border: 1px solid #444;
+        border-radius: 6px;
+        padding: 6px 10px;
+        display: inline-block;
+        font-size: 0.85em;
+        color: #0ff;
+        min-width: 90px;
+        text-align: left;
+      }
+      .vitals-inline span {
+        color: #fff;
+        font-size: 0.84em;
+        margin: 0;
+        display: block;
+      }
     </style>
   </head>
   <body>
@@ -53,10 +71,8 @@
         <tr>
           <th>Bot Name</th>
           <th>Status</th>
-          <th>PID</th>
-          <th>Version</th>
+          <th>Vitals</th>
           <th>Message</th>
-          <th>Started At</th>
           <th>Last Updated</th>
         </tr>
       </thead>
@@ -75,13 +91,26 @@
               data.bots.forEach((bot) => {
                 const row = document.createElement("tr");
 
+                // Vitals cell (dynamic for any bot)
+                let vitalsHtml = "-";
+                if (bot.status && bot.status.toUpperCase() === "STOPPED") {
+                  vitalsHtml = '<span style="color:#f00;font-weight:bold;">Stopped</span>';
+                } else if (bot.vitals && typeof bot.vitals === "object") {
+                  let vitalsRows = Object.entries(bot.vitals).map(([key, val]) => {
+                    if (Array.isArray(val)) {
+                      return `<span><b>${key}:</b> ${val.length ? val.join(", ") : '-'}<\/span>`;
+                    } else {
+                      return `<span><b>${key}:</b> ${val ?? '-'}<\/span>`;
+                    }
+                  }).join("");
+                  vitalsHtml = `<div class="vitals-inline">${vitalsRows}<\/div>`;
+                }
+
                 row.innerHTML = `
             <td>${bot.bot_name}</td>
             <td class="status-${bot.status.toLowerCase()}">${bot.status}</td>
-            <td>${bot.pid || "-"}</td>
-            <td>${bot.version || "-"}</td>
+            <td>${vitalsHtml}</td>
             <td>${bot.strategy || "-"}</td>
-            <td>${bot.started_at}</td>
             <td>${bot.last_updated}</td>
           `;
 

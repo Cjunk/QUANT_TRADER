@@ -23,7 +23,8 @@ try {
       'last_updated' => $bot['last_updated'],
       'pid'          => $meta['pid'] ?? null,
       'version'      => $meta['version'] ?? null,
-      'strategy'     => $meta['strategy'] ?? null
+      'strategy'     => $meta['strategy'] ?? null,
+      'vitals'       => $meta['vitals'] ?? null // <-- This will only work if you store vitals in metadata!
     ];
   }, $bots);
 

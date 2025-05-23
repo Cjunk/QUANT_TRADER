@@ -260,7 +260,13 @@ class PostgresDBBot:
                         "bot_name": db_config.BOT_NAME,
                         "heartbeat": True,
                         "time": datetime.datetime.utcnow().isoformat(),
-                        "auth_token": db_config.BOT_AUTH_TOKEN
+                        "auth_token": db_config.BOT_AUTH_TOKEN,
+                        "metadata": {
+                            "version": "1.2.0",
+                            "pid": os.getpid(),
+                            "strategy": "VWAP",
+                            "vitals": {"info": "this is vitals"}
+                        }
                     }
                     self.redis_client.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
                     self.logger.debug("Self-heartbeat sent.")
@@ -279,7 +285,6 @@ class PostgresDBBot:
         time_str = status_obj.get("time")
         meta = status_obj.get("metadata", {})
         auth_token = status_obj.get("auth_token")
-
         self.logger.info(f"📨 Received status update for bot: {bot_name}")
         self.logger.debug(f"Status object: {json.dumps(status_obj, indent=2)}")
 
@@ -383,41 +388,6 @@ class PostgresDBBot:
         payload = json.dumps({"symbols": current_coin_list})
         self.redis_client.publish(config_redis.COIN_CHANNEL, payload)
         self.logger.info(f"Published {len(current_coin_list)} coins to COIN_CHANNEL.")
-    def store_kline_data(self, symbol, interval, start_time, open_price, close_price,
-                         high_price, low_price, volume, turnover, confirmed):
-        """
-        Insert or update a trading.kline row. 
-        Typically you insert a new row each time a candle closes or to track partial updates.
-        """
-        insert_sql = f"""
-        INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
-        (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (symbol, interval, start_time) DO NOTHING
-        """
-
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(insert_sql, (
-                symbol,
-                interval,
-                start_time,  # Python datetime, or convert from epoch
-                open_price,
-                close_price,
-                high_price,
-                low_price,
-                volume,
-                turnover,
-                confirmed
-            ))
-            self.conn.commit()
-
-            #self.logger.info(f"Kline data inserted for {symbol}, interval={interval}, time={start_time}")
-        except Exception as e:
-            self.conn.rollback()
-            self.logger.error(f"Error inserting kline: {e}")
-        finally:
-            cursor.close()
     def store_order_book(self, symbol, price, volume, side):
         """
         Insert one order book level into orderbook_data table.
@@ -614,15 +584,16 @@ class PostgresDBBot:
             volume_change = kdata.get("Volume_Change") or kdata.get("volume_change")
             volume_slope = kdata.get("Volume_Slope") or kdata.get("volume_slope")
             rvol = kdata.get("RVOL") or kdata.get("rvol")
+            market = kdata.get("market") or "unknown2"  # Default to a market if not provided
             #self.logger.debug(f"Inserting kline: {json.dumps(kdata,indent=2)}")
             insert_sql = f"""
             INSERT INTO {db_config.DB_TRADING_SCHEMA}.kline_data 
                 (symbol, interval, start_time, open, close, high, low, volume, turnover, confirmed, 
                 rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band, 
-                volume_ma, volume_change, volume_slope, rvol)
+                volume_ma, volume_change, volume_slope, rvol,market)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 
                         %s, %s, %s, %s, %s, %s, %s, 
-                        %s, %s, %s, %s) 
+                        %s, %s, %s, %s,%s) 
                         ON CONFLICT (symbol, interval, start_time) DO UPDATE SET
                             close = EXCLUDED.close,
                             high = EXCLUDED.high,
@@ -640,7 +611,8 @@ class PostgresDBBot:
                             volume_ma = EXCLUDED.volume_ma,
                             volume_change = EXCLUDED.volume_change,
                             volume_slope = EXCLUDED.volume_slope,
-                            rvol = EXCLUDED.rvol
+                            rvol = EXCLUDED.rvol,
+                            market=EXCLUDED.market
             """
 
             cursor = self.conn.cursor()
@@ -648,7 +620,7 @@ class PostgresDBBot:
                 symbol, interval, start_dt, open_price, close_price,
                 high_price, low_price, volume, turnover, confirmed,
                 rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band,
-                volume_ma, volume_change, volume_slope, rvol
+                volume_ma, volume_change, volume_slope, rvol,market
             ))
             self.conn.commit()
             cursor.close()
@@ -672,37 +644,6 @@ class PostgresDBBot:
             self.logger.error(f"🚨 Error buffering summarized trade data: {e}")
 
 
-    def store_trade_summary(self, symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price):
-        insert_sql = f"""
-            INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_summary_data
-            (symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (symbol, minute_start) DO UPDATE
-            SET
-                total_volume = EXCLUDED.total_volume,
-                vwap = EXCLUDED.vwap,
-                trade_count = EXCLUDED.trade_count,
-                largest_trade_volume = EXCLUDED.largest_trade_volume,
-                largest_trade_price = EXCLUDED.largest_trade_price
-        """
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(insert_sql, (
-                symbol,
-                minute_start,
-                total_volume,
-                vwap,
-                trade_count,
-                largest_trade_volume,
-                largest_trade_price
-            ))
-            self.conn.commit()
-            self.logger.debug(f"✅ Trade summary inserted/updated for {symbol} @ {minute_start}")
-        except Exception as e:
-            self.conn.rollback()
-            self.logger.error(f"❌ Error inserting trade summary: {e}")
-        finally:
-            cursor.close()
     def _flush_trade_buffer(self):
         while self.running:
             if self.trade_buffer:

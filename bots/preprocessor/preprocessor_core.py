@@ -5,22 +5,23 @@ import pandas as pd
 from collections import deque
 from utils.logger import setup_logger
 from utils.global_indicators import GlobalIndicators
+from config import config_redis as r_cfg
 
 # Redis + Bot Configs
 from config.config_redis import (
     REDIS_HOST, REDIS_PORT, REDIS_DB,
-    KLINE_UPDATES, TRADE_CHANNEL, ORDER_BOOK_UPDATES,
+    KLINE_UPDATES,
     PRE_PROC_KLINE_UPDATES, PRE_PROC_TRADE_CHANNEL, PRE_PROC_ORDER_BOOK_UPDATES,
-    SERVICE_STATUS_CHANNEL, HEARTBEAT_CHANNEL
+    SERVICE_STATUS_CHANNEL
 )
+
+from config.config_common import HEARTBEAT_CHANNEL, HEARTBEAT_INTERVAL_SECONDS
 
 from config.config_auto_preprocessor_bot import (
     LOG_FILENAME, LOG_LEVEL, BOT_NAME, BOT_AUTH_TOKEN,
     HEARTBEAT_INTERVAL, WINDOW_SIZE,
     STRATEGY_NAME, VERSION, DESCRIPTION
 )
-
-from config.config_common import HEARTBEAT_INTERVAL_SECONDS
 
 class PreprocessorBot:
     def __init__(self, log_filename=LOG_FILENAME):
@@ -32,21 +33,50 @@ class PreprocessorBot:
         self.kline_windows = {}   # {(symbol, interval, market): deque}
         self.trade_windows = {}   # {(symbol, minute): [trades]}
         self.market_channels = {
-            "linear": r_cfg.REDIS_CHANNEL["linear.kline_out"],
-            "spot": r_cfg.REDIS_CHANNEL["spot.kline_out"],
+            "linear": {
+                "kline": r_cfg.REDIS_CHANNEL["linear.kline_out"],
+                "trade": r_cfg.REDIS_CHANNEL["linear.trade_out"],
+                "orderbook": r_cfg.REDIS_CHANNEL["linear.orderbook_out"]
+            },
+            "spot": {
+                "kline": r_cfg.REDIS_CHANNEL["spot.kline_out"],
+                "trade": r_cfg.REDIS_CHANNEL["spot.trade_out"],
+                "orderbook": r_cfg.REDIS_CHANNEL["spot.orderbook_out"]
+            },
             # Add derivatives if available
-            "derivatives": r_cfg.REDIS_CHANNEL["derivatives.kline_out"] if "derivatives.kline_out" in r_cfg.REDIS_CHANNEL else None
+            "derivatives": {
+                "kline": r_cfg.REDIS_CHANNEL["derivatives.kline_out"] if "derivatives.kline_out" in r_cfg.REDIS_CHANNEL else None,
+                "trade": r_cfg.REDIS_CHANNEL["derivatives.trade_out"] if "derivatives.trade_out" in r_cfg.REDIS_CHANNEL else None,
+                "orderbook": r_cfg.REDIS_CHANNEL["derivatives.orderbook_out"] if "derivatives.orderbook_out" in r_cfg.REDIS_CHANNEL else None
+            }
         }
+        self.total_klines_processed = 0
+        self.nans_last_heartbeat = 0
+        self.nans_this_interval = 0
 
     def _connect_redis(self):
         self.redis_client = redis.Redis(
             host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
         )
         self.pubsub = self.redis_client.pubsub()
-        # Subscribe to all available kline channels
-        channels_to_sub = [ch for ch in self.market_channels.values() if ch]
-        self.pubsub.subscribe(*channels_to_sub, TRADE_CHANNEL, ORDER_BOOK_UPDATES)
-        self.logger.info(f"✅ Connected to Redis and subscribed to: {channels_to_sub + [TRADE_CHANNEL, ORDER_BOOK_UPDATES]}")
+        # Subscribe to the same kline, trade, and orderbook channels as the WebSocketBot publishes to
+        channels_to_sub = [
+            r_cfg.REDIS_CHANNEL["spot.kline_out"],
+            r_cfg.REDIS_CHANNEL["linear.kline_out"],
+            r_cfg.REDIS_CHANNEL["spot.trade_out"],
+            r_cfg.REDIS_CHANNEL["linear.trade_out"],
+            r_cfg.REDIS_CHANNEL["spot.orderbook_out"],
+            r_cfg.REDIS_CHANNEL["linear.orderbook_out"]
+        ]
+        # Optionally add derivatives if present
+        if "derivatives.kline_out" in r_cfg.REDIS_CHANNEL:
+            channels_to_sub.append(r_cfg.REDIS_CHANNEL["derivatives.kline_out"])
+        if "derivatives.trade_out" in r_cfg.REDIS_CHANNEL:
+            channels_to_sub.append(r_cfg.REDIS_CHANNEL["derivatives.trade_out"])
+        if "derivatives.orderbook_out" in r_cfg.REDIS_CHANNEL:
+            channels_to_sub.append(r_cfg.REDIS_CHANNEL["derivatives.orderbook_out"])
+        self.pubsub.subscribe(*channels_to_sub)
+        self.logger.info(f"✅ Connected to Redis and subscribed to: {channels_to_sub}")
 
     def _register_bot(self):
         payload = {
@@ -69,15 +99,22 @@ class PreprocessorBot:
                 payload = {
                     "bot_name": self.bot_name,
                     "heartbeat": True,
-                    "time": datetime.datetime.now(pytz.timezone("Australia/Sydney")).isoformat(),
+                    "time": datetime.datetime.utcnow().isoformat(),
+                    "auth_token": self.auth_token,
                     "metadata": {
                         "version": VERSION,
                         "pid": os.getpid(),
-                        "strategy": STRATEGY_NAME
+                        "strategy": STRATEGY_NAME,
+                        "vitals": {
+                            "total_klines_processed": int(self.total_klines_processed),
+                            "nans_last_heartbeat": int(self.nans_last_heartbeat)
+                        }
                     }
                 }
                 self.redis_client.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
-                self.logger.debug("❤️ Sent heartbeat.")
+                self.logger.debug(f"❤️ Sent heartbeat. Vitals: {payload['metadata']['vitals']}")
+                self.nans_last_heartbeat = self.nans_this_interval
+                self.nans_this_interval = 0
             except Exception as e:
                 self.logger.warning(f"⚠️ Heartbeat failed: {e}")
             time.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -104,14 +141,18 @@ class PreprocessorBot:
 
     def _route_message(self, channel, payload):
         # Route by channel for kline, trade, orderbook
-        for market, ch in self.market_channels.items():
-            if ch and channel == ch:
+        
+        for market, chans in self.market_channels.items():
+            if chans["kline"] == channel:
+                print(f"🔄 Routing message on channel: {channel}")
                 self._process_kline(payload, market)
                 return
-        if channel == TRADE_CHANNEL:
-            self._process_trade(payload)
-        elif channel == ORDER_BOOK_UPDATES:
-            self._process_orderbook(payload)
+            if chans["trade"] == channel:
+                self._process_trade(payload, market)
+                return
+            if chans["orderbook"] == channel:
+                self._process_orderbook(payload, market)
+                return
 
     def _preload_kline_window(self, symbol, interval, market):
         """
@@ -144,6 +185,8 @@ class PreprocessorBot:
                 self.logger.debug(f"🔁 Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
                 return
 
+        # Ensure the market type is always included in the kline payload
+        payload['market'] = market
         self.kline_windows[key].append(payload)
         self.redis_client.rpush(redis_key, json.dumps(payload))
         self.redis_client.ltrim(redis_key, -WINDOW_SIZE, -1)
@@ -154,13 +197,19 @@ class PreprocessorBot:
             enriched_df = self.GlobalIndicators.compute_indicators(df.copy())
             enriched_kline = enriched_df.iloc[-1].to_dict()
             enriched_kline['start_time'] = df.iloc[-1]['start_time']
+            # Always include the market type in the enriched kline payload
+            enriched_kline['market'] = market
+            # Count NaNs/nulls in the enriched kline
+            nans = sum(pd.isnull(list(enriched_kline.values())))
+            self.nans_this_interval += nans
+            self.total_klines_processed += 1
             # Publish to the correct processed channel for the market
-            out_channel = f"{PRE_PROC_KLINE_UPDATES}:{market}"
+            out_channel = f"{PRE_PROC_KLINE_UPDATES}"
             self.redis_client.publish(out_channel, json.dumps(enriched_kline))
         except Exception as e:
             self.logger.error(f"❌ Error processing kline for {market}: {e}")
 
-    def _process_trade(self, payload):
+    def _process_trade(self, payload, market=None):
         try:
             symbol = payload['symbol']
             trade_time = pd.to_datetime(payload['trade_time'], utc=True).floor('min')
@@ -171,6 +220,14 @@ class PreprocessorBot:
             })
         except Exception as e:
             self.logger.error(f"❌ Error processing trade: {e}")
+
+    def _process_orderbook(self, payload, market=None):
+        try:
+            # Publish to the correct processed channel for the market
+            out_channel = f"{PRE_PROC_ORDER_BOOK_UPDATES}:{market}" if market else PRE_PROC_ORDER_BOOK_UPDATES
+            self.redis_client.publish(out_channel, json.dumps(payload))
+        except Exception as e:
+            self.logger.error(f"❌ Error processing orderbook for {market}: {e}")
 
     def _publish_trade_summary(self, key, trades):
         symbol, minute_start = key
@@ -187,10 +244,22 @@ class PreprocessorBot:
             "largest_trade_volume": max_trade['volume'],
             "largest_trade_price": max_trade['price']
         }
-        self.redis_client.publish(PRE_PROC_TRADE_CHANNEL, json.dumps(summary))
-
-    def _process_orderbook(self, payload):
-        self.redis_client.publish(PRE_PROC_ORDER_BOOK_UPDATES, json.dumps(payload))
+        # Publish to the correct processed channel for the market (if possible)
+        # Try to infer market from the key if possible (not always possible, fallback to generic)
+        market = None
+        for mkt in self.market_channels:
+            if mkt == "derivatives":
+                continue
+            # k is a tuple: (symbol, interval, market)
+            for k in self.kline_windows:
+                if isinstance(k, tuple) and len(k) >= 1 and k[0] == symbol:
+                    if len(k) == 3 and k[2] == mkt:
+                        market = mkt
+                        break
+            if market:
+                break
+        out_channel = f"{PRE_PROC_TRADE_CHANNEL}:{market}" if market else PRE_PROC_TRADE_CHANNEL
+        self.redis_client.publish(out_channel, json.dumps(summary))
 
     def _final_flush(self):
         self.logger.info("🔄 Flushing remaining trades...")

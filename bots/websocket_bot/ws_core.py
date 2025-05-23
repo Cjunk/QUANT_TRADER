@@ -3,7 +3,7 @@ WebSocketBot Core Logic
 Author: Jericho
 Clean, professional, and beautifully structured. All variables at the top, concise logic, and clear comments.
 """
-import json, threading, queue, time, signal, datetime, logging
+import json, threading, queue, time, signal, datetime, logging, os
 import websocket
 import bots.websocket_bot.config_websocket_bot as cfg
 from bots.config import config_redis as r_cfg
@@ -57,6 +57,25 @@ class WebSocketBot(threading.Thread):
         self._connect_ws()
 
     def run(self):
+        # Send 'started' status to DB bot on startup
+        started_payload = {
+            "bot_name": cfg.BOT_NAME,
+            "status": "started",
+            "time": datetime.datetime.utcnow().isoformat(),
+            "auth_token": cfg.BOT_AUTH_TOKEN,
+            "metadata": {
+                "version": getattr(cfg, "VERSION", "1.0.0"),
+                "pid": os.getpid(),
+                "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
+                "vitals": {
+                    "market": self.market,
+                    "subscriptions": sorted(list(self.subscriptions)) if self.subscriptions else [],
+                    "kline_count": getattr(self, "kline_count", 0),
+                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                }
+            }
+        }
+        self.redis.publish(r_cfg.SERVICE_STATUS_CHANNEL, json.dumps(started_payload))
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot started.")
         self.logger.info(f"🚀 WebSocketBot running. {self.market}")
         while not self.exit_evt.is_set():
@@ -79,6 +98,26 @@ class WebSocketBot(threading.Thread):
                 self.logger.warning(f"⚠️ WebSocket close failed: {e}")
         if self.sub_handler: self.sub_handler.stop()
         self._save_subscriptions_to_redis()
+        # --- Send shutdown status to DB bot ---
+        subs_list = sorted(list(self.subscriptions)) if self.subscriptions else []
+        shutdown_payload = {
+            "bot_name": cfg.BOT_NAME,
+            "status": "stopped",
+            "time": datetime.datetime.utcnow().isoformat(),
+            "auth_token": cfg.BOT_AUTH_TOKEN,
+            "metadata": {
+                "version": getattr(cfg, "VERSION", "1.0.0"),
+                "pid": os.getpid(),
+                "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
+                "vitals": {
+                    "market": self.market,
+                    "subscriptions": subs_list,
+                    "kline_count": getattr(self, "kline_count", 0),
+                    "timestamp": datetime.datetime.utcnow().isoformat(),
+                }
+            }
+        }
+        self.redis.publish(r_cfg.SERVICE_STATUS_CHANNEL, json.dumps(shutdown_payload))
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
         self.logger.info("✅ Shutdown complete.")
 
@@ -218,7 +257,7 @@ class WebSocketBot(threading.Thread):
                     on_open=lambda ws: (self.logger.info("WS connected"), self._update_subscriptions()),
                     on_message=self._on_message,
                     on_error=lambda ws, err: self.logger.error(f"WS error: {err}"),
-                    on_close=lambda *_: self.logger.warning("WS closed"),
+                    on_close=lambda *_: (self.logger.warning("WS closed"), self.channels.clear()),
                     on_pong=lambda *_: self.logger.debug("pong"),
                 )
                 self.ws.run_forever(ping_interval=PING_SEC, ping_timeout=PONG_TIMEOUT)
@@ -252,13 +291,17 @@ class WebSocketBot(threading.Thread):
             self.exit_evt.wait(5)
 
     def _heartbeat(self):
-        kline_count = getattr(self, "kline_count", 0)
         while not self.exit_evt.is_set():
-            # Prepare vital info
+            # Gather subscriptions for all markets
+            all_subs = {}
+            for mkt in ["spot", "linear", "derivatives"]:
+                key = f"{r_cfg.REDIS_SUBSCRIPTION_KEY}:{mkt}"
+                subs = self.redis.smembers(key)
+                all_subs[mkt] = sorted(list(subs)) if subs else []
             vital_info = {
                 "market": self.market,
-                "subscriptions": sorted(list(self.subscriptions)),
-                "kline_count": kline_count,
+                "subscriptions": all_subs,
+                "kline_count": getattr(self, "kline_count", 0),
                 "timestamp": datetime.datetime.utcnow().isoformat(),
             }
             payload = {
@@ -266,7 +309,12 @@ class WebSocketBot(threading.Thread):
                 "heartbeat": True,
                 "time": datetime.datetime.utcnow().isoformat(),
                 "auth_token": cfg.BOT_AUTH_TOKEN,
-                "vitals": vital_info
+                "metadata": {
+                    "version": getattr(cfg, "VERSION", "1.0.0"),
+                    "pid": os.getpid(),
+                    "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
+                    "vitals": vital_info
+                }
             }
             self.redis.publish(common_cfg.HEARTBEAT_CHANNEL, json.dumps(payload))
             self.exit_evt.wait(common_cfg.HEARTBEAT_INTERVAL_SECONDS)

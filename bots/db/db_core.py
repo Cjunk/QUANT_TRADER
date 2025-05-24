@@ -24,7 +24,7 @@ import redis
 import numpy as np
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import pytz
 import psycopg2
@@ -40,6 +40,7 @@ from wallet_balance import store_wallet_balances
 from sqlalchemy import create_engine
 from utils.logger import setup_logger
 from psycopg2.extensions import register_adapter, AsIs
+from bots.utils.heartbeat import send_heartbeat
 if os.name == 'nt':
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -268,7 +269,7 @@ class PostgresDBBot:
                             "vitals": {"info": "this is vitals"}
                         }
                     }
-                    self.redis_client.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
+                    send_heartbeat(payload, status="heartbeat")
                     self.logger.debug("Self-heartbeat sent.")
                 except Exception as e:
                     self.logger.warning(f"Failed to send self-heartbeat: {e}")
@@ -315,8 +316,8 @@ class PostgresDBBot:
             cursor.close()
             return
 
-        self.logger.info(f"🔐 Authenticated bot '{bot_name}' (hash={hashed_auth_token})")
-        print(f"[AUTH DEBUG] AUTH SUCCESS\n  Raw config token: {auth_token!r}\n  Computed hash:   {hashed_auth_token}\n  DB value:        {db_token}")
+        #self.logger.info(f"🔐 Authenticated bot '{bot_name}' (hash={hashed_auth_token})")
+        #print(f"[AUTH DEBUG] AUTH SUCCESS\n  Raw config token: {auth_token!r}\n  Computed hash:   {hashed_auth_token}\n  DB value:        {db_token}")
 
         # 🔄 Check if bot exists in bots table
         cursor.execute(f"""

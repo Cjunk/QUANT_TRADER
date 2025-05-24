@@ -20,13 +20,14 @@ It registers itself on startup, sends heartbeats to Redis, and maintains a persi
 import os
 import time
 import json
-import redis
 import threading
 import datetime
 from wallet_sync import get_bybit_wallet, extract_wallet_balances
 from config.config_redis import REDIS_HOST, REDIS_PORT, REDIS_DB, SERVICE_STATUS_CHANNEL, HEARTBEAT_CHANNEL
 from config.config_ts import BOT_NAME, BOT_AUTH_TOKEN, LOG_FILENAME
 from utils.logger import setup_logger
+from bots.utils.redis_client import get_redis
+from bots.utils.heartbeat import send_heartbeat  # Import the shared heartbeat utility
 
 class TradeSupervisor:
     def __init__(self, log_filename=None):
@@ -43,12 +44,7 @@ class TradeSupervisor:
         self.running = True
         self.heartbeat_interval = 120  # Seconds
 
-        self.redis = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True
-        )
+        self.redis = get_redis()
 
     def register(self):
         """
@@ -73,14 +69,22 @@ class TradeSupervisor:
         Send periodic heartbeat signals to Redis for liveness checks.
         Runs in a background thread.
         """
+        # Heartbeat logic is now handled by the shared utility. This method is intentionally minimal.
         while self.running:
             try:
                 payload = {
                     "bot_name": self.bot_name,
                     "heartbeat": True,
-                    "time": datetime.datetime.utcnow().isoformat()
+                    "time": datetime.datetime.utcnow().isoformat(),
+                    "auth_token": getattr(self, "auth_token", None),
+                    "metadata": {
+                        "version": getattr(self, "version", "1.0.0"),
+                        "pid": os.getpid(),
+                        "strategy": getattr(self, "strategy", "-"),
+                        "vitals": {}
+                    }
                 }
-                self.redis.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
+                send_heartbeat(payload, status="heartbeat")
                 self.logger.debug("❤️ Sent heartbeat.")
             except Exception as e:
                 self.logger.warning(f"Heartbeat failed: {e}")

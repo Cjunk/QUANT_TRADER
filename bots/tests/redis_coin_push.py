@@ -14,8 +14,8 @@ r.smembers("spot_coin_subscriptions")
 r.smembers("linear_coin_subscriptions")
 
 #linear test
-r.lpush("linear_coin_subscriptions", json.dumps({"action": "set", "market":"linear","symbols": ["BTCUSDT"], "topics": ["kline.1", "orderbook.200", "trade"]}))
-
+r.lpush("linear_coin_subscriptions", json.dumps({"action": "set", "owner":"me","market":"linear","symbols": ["BTCUSDT"], "topics": ["kline.1", "kline.5","kline.60","kline.D","orderbook.200", "trade"]}))
+r.lpush("spot_coin_subscriptions", json.dumps({"action": "set", "owner":"me","market":"linear","symbols": ["BTCUSDT"], "topics": ["kline.1", "kline.5","kline.60","kline.D","orderbook.200", "trade"]}))
 r.lpush("linear_coin_subscriptions", json.dumps({
     "action": "set",
     "symbols": [],

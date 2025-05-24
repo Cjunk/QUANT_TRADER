@@ -5,7 +5,6 @@ import sys
 import time
 import json
 import threading
-import redis
 import pandas as pd
 import datetime
 import logging
@@ -27,17 +26,14 @@ from config.config_trigger_bot import (
     BOT_NAME, LOG_FILENAME, LOG_LEVEL
 )
 from utils.logger import setup_logger
+from bots.utils.redis_client import get_redis
+from utils.heartbeat import send_heartbeat  # Import the shared heartbeat utility
 
 class TriggerBot:
     def __init__(self):
         self.logger = setup_logger(LOG_FILENAME, getattr(logging, LOG_LEVEL.upper(), logging.WARNING))
         self.running = True
-        self.redis_client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True
-        )
+        self.redis_client = get_redis()
         self.pubsub = None
         self.db_conn = None
         self.windows = {}  # {(symbol, interval): deque}
@@ -417,6 +413,28 @@ class TriggerBot:
             self.logger.error(f"❌ Failed to insert signal: {e}")
         finally:
             cursor.close()
+
+    def heartbeat(self):
+        # Heartbeat logic is now handled by the shared utility. This method is intentionally minimal.
+        while self.running:
+            try:
+                payload = {
+                    "bot_name": self.bot_name,
+                    "heartbeat": True,
+                    "time": datetime.datetime.utcnow().isoformat(),
+                    "auth_token": self.auth_token,
+                    "metadata": {
+                        "version": getattr(self, "version", "1.0.0"),
+                        "pid": os.getpid(),
+                        "strategy": getattr(self, "strategy", "-"),
+                        "vitals": {}
+                    }
+                }
+                send_heartbeat(payload, status="heartbeat")
+                self.logger.debug("❤️ Sent heartbeat.")
+            except Exception as e:
+                self.logger.warning(f"Heartbeat failed: {e}")
+            time.sleep(self.heartbeat_interval)
 
 if __name__ == "__main__":
     if sys.prefix == sys.base_prefix:

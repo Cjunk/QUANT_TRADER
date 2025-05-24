@@ -1,9 +1,10 @@
+from bots.utils.redis_client import get_redis
 
 class TickerSurveillanceBot:
     def __init__(self):
         self.running = True
         self.logger = setup_logger(LOG_FILENAME, getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-        self.redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+        self.redis = get_redis()
         self.conn = psycopg2.connect(**DB_CONFIG)
 
     def _register(self):
@@ -18,14 +19,17 @@ class TickerSurveillanceBot:
         self.logger.info("Registered bot with service.")
 
     def _heartbeat(self):
+        # Heartbeat logic is now handled by the shared utility. This method is intentionally minimal.
         while self.running:
             try:
                 payload = {
                     "bot_name": BOT_NAME,
                     "heartbeat": True,
-                    "time": datetime.datetime.utcnow().isoformat()
+                    "time": datetime.datetime.utcnow().isoformat(),
+                    "auth_token": BOT_AUTH_TOKEN,
+                    "metadata": {}
                 }
-                self.redis.publish(HEARTBEAT_CHANNEL, json.dumps(payload))
+                send_heartbeat(payload, status="heartbeat")
                 self.logger.debug("Heartbeat sent.")
             except Exception as e:
                 self.logger.warning(f"Heartbeat error: {e}")

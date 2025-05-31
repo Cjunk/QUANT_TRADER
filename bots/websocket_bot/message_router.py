@@ -1,9 +1,9 @@
 import datetime, json, logging, time
 from collections import defaultdict
 
-from bots.config import config_redis as r_cfg
-from bots.websocket_bot.config_websocket_bot import ORDER_BOOK_DEPTH
-from bots.utils.logger import setup_logger
+from config import config_redis as r_cfg
+from config_websocket_bot import ORDER_BOOK_DEPTH
+from utils.logger import setup_logger
 
 # ==== Jericho: Configurable Constants ====
 SNAPSHOT_REFRESH = 360           # seconds

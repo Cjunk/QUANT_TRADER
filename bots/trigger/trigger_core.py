@@ -1,4 +1,16 @@
-# --- trigger_service.py ---
+# --- trigger_core.py ---
+"""
+TriggerBot Core Logic
+Author: Jericho | 2025-05-25
+
+Professional, modular, and production-grade trend trigger bot for quant trading.
+Handles kline analysis, emits signals, and maintains heartbeat/status for monitoring.
+
+- Uses clean Redis/DB connection logic (see db_core.py for style)
+- Imports heartbeat utility from shared bots.utils.heartbeat
+- All config and runtime values are sourced from config files
+- Modern logging, docstrings, and section headers
+"""
 
 import os
 import sys
@@ -11,35 +23,47 @@ import logging
 import psycopg2
 import pytz
 from collections import deque
+
+# --- Path and Encoding Setup ---
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if os.name == 'nt':
     sys.stdout.reconfigure(encoding='utf-8')
 
-from config.config_redis import (
-    REDIS_HOST, REDIS_PORT, REDIS_DB,
-    PRE_PROC_KLINE_UPDATES,TRIGGER_QUEUE_CHANNEL
-)
+# --- Config Imports ---
 from config.config_db import (
     DB_HOST, DB_PORT, DB_DATABASE, DB_USER, DB_PASSWORD
 )
-from config.config_trigger_bot import (
-    BOT_NAME, LOG_FILENAME, LOG_LEVEL
-)
+from config.config_trigger_bot import BOT_NAME, LOG_FILENAME, LOG_LEVEL
+from config.config_redis import PRE_PROC_KLINE_UPDATES, TRIGGER_QUEUE_CHANNEL
 from utils.logger import setup_logger
-from bots.utils.redis_client import get_redis
-from utils.heartbeat import send_heartbeat  # Import the shared heartbeat utility
+from utils import get_redis, send_heartbeat  # Professional re-exported imports
 
+# === TriggerBot Class ===
 class TriggerBot:
+    """
+    Trend trigger bot for quant trading. Listens to kline updates, analyzes trends, emits signals, and maintains heartbeat.
+    """
+    WINDOW_SIZE = 20
+    DEV_MODE = True  # Set False for production
+    MA_WINDOW = 5 if DEV_MODE else 200
+    MIN_CONFIDENCE = 20 if DEV_MODE else 65
+
     def __init__(self):
         self.logger = setup_logger(LOG_FILENAME, getattr(logging, LOG_LEVEL.upper(), logging.WARNING))
         self.running = True
-        self.redis_client = get_redis()
+        self.redis_client = None
         self.pubsub = None
         self.db_conn = None
         self.windows = {}  # {(symbol, interval): deque}
-        self.WINDOW_SIZE = 20
+        self.heartbeat_interval = 30  # seconds (could be from config)
+        self.bot_name = BOT_NAME
+        self.auth_token = getattr(self, 'auth_token', None) or os.environ.get('TRIGGER_BOT_AUTH_TOKEN', 'devtoken')
+        self.version = "1.0.0"
+        self.strategy = "trend_trigger"
 
+    # === Setup Methods ===
     def connect_postgres(self):
+        """Connect to PostgreSQL database."""
         try:
             self.db_conn = psycopg2.connect(
                 host=DB_HOST,
@@ -53,16 +77,31 @@ class TriggerBot:
             self.logger.error(f"❌ Failed to connect to Postgres: {e}")
             sys.exit(1)
 
+    def connect_redis(self):
+        """Connect to Redis and subscribe to kline updates."""
+        while True:
+            try:
+                self.redis_client = get_redis()
+                self.redis_client.ping()
+                self.logger.info("✅ Connected to Redis.")
+                break
+            except Exception as e:
+                self.logger.warning(f"Redis unavailable, retrying in 5 seconds... {e}")
+                time.sleep(5)
+        self.pubsub = self.redis_client.pubsub()
+        self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
+        self.logger.info(f"Subscribed to Redis channel: {PRE_PROC_KLINE_UPDATES}")
+
+    # === Data Preload ===
     def preload_recent_klines(self):
+        """Preload recent kline data for all symbols/intervals from DB."""
         try:
             cursor = self.db_conn.cursor()
             cursor.execute("SET search_path TO trading;")
-
             cursor.execute("SELECT symbol FROM current_coins;")
             symbols = [row[0] for row in cursor.fetchall()]
-
             for symbol in symbols:
-                for interval in ["1","5", "60", "D"]:
+                for interval in ["1", "5", "60", "D"]:
                     cursor.execute(f"""
                         SELECT symbol, interval, start_time, close, rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band, volume, volume_ma, volume_change, volume_slope, rvol,open, high, low, turnover, confirmed
                         FROM kline_data
@@ -70,98 +109,30 @@ class TriggerBot:
                         ORDER BY start_time DESC
                         LIMIT {self.WINDOW_SIZE}
                     """, (symbol, interval))
-
                     rows = cursor.fetchall()
                     if rows:
-                        rows.reverse()  # So oldest first
+                        rows.reverse()
                         self.windows[(symbol, interval)] = [
                             {
-                                "symbol": r[0],
-                                "interval": r[1],
-                                "start_time": r[2],
-                                "close": r[3],
-                                "RSI": r[4],
-                                "MACD": r[5],
-                                "MACD_Signal": r[6],
-                                "MACD_Hist": r[7],
-                                "MA": r[8],
-                                "UpperBand": r[9],
-                                "LowerBand": r[10],
-                                "volume": r[11],
-                                "Volume_MA": r[12],
-                                "Volume_Change": r[13],
-                                "Volume_Slope": r[14],
-                                "RVOL": r[15],
-                                "open": r[16],
-                                "high": r[17],
-                                "low": r[18],
-                                "turnover": r[19],
-                                "confirmed": r[20]
-
-                            }
-                            for r in rows
+                                "symbol": r[0], "interval": r[1], "start_time": r[2], "close": r[3],
+                                "RSI": r[4], "MACD": r[5], "MACD_Signal": r[6], "MACD_Hist": r[7], "MA": r[8],
+                                "UpperBand": r[9], "LowerBand": r[10], "volume": r[11], "Volume_MA": r[12],
+                                "Volume_Change": r[13], "Volume_Slope": r[14], "RVOL": r[15], "open": r[16],
+                                "high": r[17], "low": r[18], "turnover": r[19], "confirmed": r[20]
+                            } for r in rows
                         ]
                         self.logger.info(f"✅ Preloaded {len(rows)} candles for {symbol}-{interval}")
-
             cursor.close()
-
         except Exception as e:
             self.logger.error(f"❌ Preloading klines failed: {e}")
             sys.exit(1)
-    def _refresh_symbols_periodically(self):
-        while self.running:
-            try:
-                time.sleep(1800)  # 30 minutes
-                cursor = self.db_conn.cursor()
-                cursor.execute("SET search_path TO trading;")
-                cursor.execute("SELECT symbol FROM current_coins;")
-                new_symbols = [row[0] for row in cursor.fetchall()]
-                cursor.close()
 
-                current_symbols = {key[0] for key in self.windows.keys()}
-
-                for symbol in new_symbols:
-                    if symbol not in current_symbols:
-                        for interval in ["1", "5", "60", "D"]:
-                            cursor = self.db_conn.cursor()
-                            cursor.execute(f"""
-                                SELECT symbol, interval, start_time, close, rsi, macd, volume, volume_ma
-                                FROM kline_data
-                                WHERE symbol = %s AND interval = %s
-                                ORDER BY start_time DESC
-                                LIMIT {self.WINDOW_SIZE}
-                            """, (symbol, interval))
-
-                            rows = cursor.fetchall()
-                            if rows:
-                                rows.reverse()
-                                self.windows[(symbol, interval)] = [
-                                    {
-                                        "symbol": r[0],
-                                        "interval": r[1],
-                                        "start_time": r[2],
-                                        "close": r[3],
-                                        "RSI": r[4],
-                                        "MACD": r[5],
-                                        "volume": r[6],
-                                        "Volume_MA": r[7]
-                                    }
-                                    for r in rows
-                                ]
-                                self.logger.info(f"✅ Dynamically loaded {len(rows)} candles for {symbol}-{interval}")
-                            cursor.close()
-
-            except Exception as e:
-                self.logger.error(f"❌ Error refreshing symbols: {e}")
-
-        self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
-        self.logger.info("✅ Connected to Redis and subscribed to PRE_PROC_KLINE_UPDATES")
-
-    def _start_background(self):
+    # === Redis Listener ===
+    def _start_redis_listener(self):
         threading.Thread(target=self.listen_redis, daemon=True).start()
 
     def listen_redis(self):
+        """Listen for kline updates from Redis and process them."""
         for message in self.pubsub.listen():
             if message["type"] == "message":
                 try:
@@ -170,28 +141,30 @@ class TriggerBot:
                 except Exception as e:
                     self.logger.error(f"❌ Error handling kline message: {e}")
 
+    # === Kline Processing ===
     def process_kline(self, payload):
         symbol = payload["symbol"]
         interval = payload["interval"]
         key = (symbol, interval)
-
         if key not in self.windows:
             self.windows[key] = []
-
         self.windows[key].append(payload)
-
         if len(self.windows[key]) > self.WINDOW_SIZE:
             self.windows[key].pop(0)
-
         if len(self.windows[key]) == self.WINDOW_SIZE:
             self.analyze_trend(key)
-        #self.logger.warning(f"🧪 Incoming kline for {symbol}-{interval}: {payload}")
-    def analyze_trend(self, key):
-        symbol, interval = key
-        DEV_MODE = True  # Set False for production
-        MA_WINDOW = 5 if DEV_MODE else 200  # shorter MA in DEV
-        MIN_CONFIDENCE = 20 if DEV_MODE else 65  # Lower confidence threshold in DEV
 
+    def analyze_trend(self, key):
+        """
+        Analyze the trend for the given symbol and interval key.
+        - Calculates various indicators (MACD, RSI, Bollinger Bands)
+        - Determines trend direction and strength
+        - Emits signals if trend conditions are met
+        """
+        symbol, interval = key
+        DEV_MODE = self.DEV_MODE
+        MA_WINDOW = self.MA_WINDOW
+        MIN_CONFIDENCE = self.MIN_CONFIDENCE
         try:
             # 📊 Clean raw DataFrame
             df_raw = pd.DataFrame(self.windows[key])
@@ -312,10 +285,35 @@ class TriggerBot:
         except Exception as e:
             self.logger.error(f"❌ Trend analysis failed: {e}")
 
+    # === Signal Emission & Logging ===
+    def emit_signal(self, signal_type, symbol, interval, df, value=None, direction=None, confidence=None, window=None):
+        """Build and insert a signal with context from df automatically."""
+        try:
+            context = {
+                "close": float(df["close"].iloc[-1]),
+                "volume": float(df["volume"].iloc[-1]),
+                "volume_ma": float(df["Volume_MA"].iloc[-1]),
+                "rsi": float(df["RSI"].iloc[-1]),
+                "macd": float(df["MACD"].iloc[-1]),
+                "macd_signal": float(df["MACD_Signal"].iloc[-1]),
+                "upper_band": float(df["UpperBand"].iloc[-1]),
+                "lower_band": float(df["LowerBand"].iloc[-1]),
+            }
+            self.log_signal(
+                symbol, interval,
+                signal_type=signal_type,
+                value=value,
+                context=context,
+                direction=direction,
+                confidence=confidence,
+                window=window
+            )
+        except Exception as e:
+            self.logger.error(f"❌ emit_signal failed: {e}")
 
     def log_signal(self, symbol, interval, signal_type, value=None, context=None, direction=None, confidence=None, window=None):
+        """Log signal to DB and push to Redis trigger queue."""
         window_start, window_end = window if window else (None, None)
-            # Ensure window times are JSON serializable (as ISO strings)
         window_start_str = window_start.isoformat() if window_start else None
         window_end_str = window_end.isoformat() if window_end else None
         signal = {
@@ -329,64 +327,13 @@ class TriggerBot:
             "window_start": window_start,
             "window_end": window_end
         }
-        self.insert_signal_log(signal)        
+        self.insert_signal_log(signal)
         signal["window_start"] = window_start_str
         signal["window_end"] = window_end_str
         self.redis_client.rpush(TRIGGER_QUEUE_CHANNEL, json.dumps(signal))
 
-    def emit_signal(self, signal_type, symbol, interval, df, value=None, direction=None, confidence=None, window=None):
-        """
-        Build and insert a signal with context from df automatically.
-        """
-        try:
-            context = {
-                "close": float(df["close"].iloc[-1]),
-                "volume": float(df["volume"].iloc[-1]),
-                "volume_ma": float(df["Volume_MA"].iloc[-1]),
-                "rsi": float(df["RSI"].iloc[-1]),
-                "macd": float(df["MACD"].iloc[-1]),
-                "macd_signal": float(df["MACD_Signal"].iloc[-1]),
-                "upper_band": float(df["UpperBand"].iloc[-1]),
-                "lower_band": float(df["LowerBand"].iloc[-1]),
-            }
-
-            self.log_signal(
-                symbol, interval,
-                signal_type=signal_type,
-                value=value,
-                context=context,
-                direction=direction,
-                confidence=confidence,
-                window=window
-            )
-            
-        except Exception as e:
-            self.logger.error(f"❌ emit_signal failed: {e}")
-
-    def connect_redis(self):
-        self.redis_client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True
-        )
-        self.pubsub = self.redis_client.pubsub()
-        self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
-        self.logger.info("✅ Connected to Redis and subscribed to PRE_PROC_KLINE_UPDATES")
-    def run(self):
-        self.logger.info("🚀 Trigger Bot starting...")
-        self.connect_postgres()
-        self.preload_recent_klines()
-        self.connect_redis()
-        self._start_background()
-        threading.Thread(target=self._refresh_symbols_periodically, daemon=True).start()
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.logger.info("🛑 Keyboard interrupt received. Stopping TriggerBot.")
-            self.running = False
     def insert_signal_log(self, signal):
+        """Insert signal into the signal_log table in DB."""
         cursor = self.db_conn.cursor()
         value = float(signal.get("value")) if signal.get("value") is not None else None
         confidence = float(signal.get("confidence")) if signal.get("confidence") is not None else None
@@ -414,33 +361,126 @@ class TriggerBot:
         finally:
             cursor.close()
 
-    def heartbeat(self):
-        # Heartbeat logic is now handled by the shared utility. This method is intentionally minimal.
+    # === Heartbeat ===
+    def _start_heartbeat(self):
+        """Start a background thread to send heartbeats for liveness monitoring."""
+        def heartbeat():
+            while self.running:
+                try:
+                    payload = {
+                        "bot_name": self.bot_name,
+                        "heartbeat": True,
+                        "time": datetime.datetime.utcnow().isoformat(),
+                        "auth_token": self.auth_token,
+                        "metadata": {
+                            "version": self.version,
+                            "pid": os.getpid(),
+                            "strategy": self.strategy,
+                            "vitals": {}
+                        }
+                    }
+                    send_heartbeat(payload, status="heartbeat")
+                    self.logger.debug("❤️ Sent heartbeat.")
+                except Exception as e:
+                    self.logger.warning(f"Heartbeat failed: {e}")
+                time.sleep(self.heartbeat_interval)
+        threading.Thread(target=heartbeat, daemon=True).start()
+
+    # === Main Run ===
+    def run(self):
+        self.logger.info("🚀 Trigger Bot starting...")
+        self.connect_postgres()
+        self.preload_recent_klines()
+        self.connect_redis()
+        # --- Send started status to SERVICE_STATUS_CHANNEL ---
+        started_payload = {
+            "bot_name": self.bot_name,
+            "status": "started",
+            "time": datetime.datetime.utcnow().isoformat(),
+            "auth_token": self.auth_token,
+            "metadata": {
+                "version": self.version,
+                "pid": os.getpid(),
+                "strategy": self.strategy,
+                "vitals": {}
+            }
+        }
+        self.redis_client.publish("SERVICE_STATUS_CHANNEL", json.dumps(started_payload))
+        self._start_redis_listener()
+        self._start_heartbeat()
+        threading.Thread(target=self._refresh_symbols_periodically, daemon=True).start()
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.logger.info("🛑 Keyboard interrupt received. Stopping TriggerBot.")
+            self.running = False
+            # --- Send stopped status to SERVICE_STATUS_CHANNEL ---
+            stopped_payload = {
+                "bot_name": self.bot_name,
+                "status": "stopped",
+                "time": datetime.datetime.utcnow().isoformat(),
+                "auth_token": self.auth_token,
+                "metadata": {
+                    "version": self.version,
+                    "pid": os.getpid(),
+                    "strategy": self.strategy,
+                    "vitals": {}
+                }
+            }
+            self.redis_client.publish("SERVICE_STATUS_CHANNEL", json.dumps(stopped_payload))
+
+    # === Symbol Refresh (unchanged) ===
+    def _refresh_symbols_periodically(self):
         while self.running:
             try:
-                payload = {
-                    "bot_name": self.bot_name,
-                    "heartbeat": True,
-                    "time": datetime.datetime.utcnow().isoformat(),
-                    "auth_token": self.auth_token,
-                    "metadata": {
-                        "version": getattr(self, "version", "1.0.0"),
-                        "pid": os.getpid(),
-                        "strategy": getattr(self, "strategy", "-"),
-                        "vitals": {}
-                    }
-                }
-                send_heartbeat(payload, status="heartbeat")
-                self.logger.debug("❤️ Sent heartbeat.")
+                time.sleep(1800)  # 30 minutes
+                cursor = self.db_conn.cursor()
+                cursor.execute("SET search_path TO trading;")
+                cursor.execute("SELECT symbol FROM current_coins;")
+                new_symbols = [row[0] for row in cursor.fetchall()]
+                cursor.close()
+
+                current_symbols = {key[0] for key in self.windows.keys()}
+
+                for symbol in new_symbols:
+                    if symbol not in current_symbols:
+                        for interval in ["1", "5", "60", "D"]:
+                            cursor = self.db_conn.cursor()
+                            cursor.execute(f"""
+                                SELECT symbol, interval, start_time, close, rsi, macd, volume, volume_ma
+                                FROM kline_data
+                                WHERE symbol = %s AND interval = %s
+                                ORDER BY start_time DESC
+                                LIMIT {self.WINDOW_SIZE}
+                            """, (symbol, interval))
+
+                            rows = cursor.fetchall()
+                            if rows:
+                                rows.reverse()
+                                self.windows[(symbol, interval)] = [
+                                    {
+                                        "symbol": r[0],
+                                        "interval": r[1],
+                                        "start_time": r[2],
+                                        "close": r[3],
+                                        "RSI": r[4],
+                                        "MACD": r[5],
+                                        "volume": r[6],
+                                        "Volume_MA": r[7]
+                                    }
+                                    for r in rows
+                                ]
+                                self.logger.info(f"✅ Dynamically loaded {len(rows)} candles for {symbol}-{interval}")
+                            cursor.close()
+
             except Exception as e:
-                self.logger.warning(f"Heartbeat failed: {e}")
-            time.sleep(self.heartbeat_interval)
+                self.logger.error(f"❌ Error refreshing symbols: {e}")
 
 if __name__ == "__main__":
     if sys.prefix == sys.base_prefix:
         print("❌ Virtual environment is NOT activated. Please activate it first.")
         sys.exit(1)
-
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 🚀 Starting TRIGGER_BOT...")
     bot = TriggerBot()
     bot.run()

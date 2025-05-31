@@ -8,7 +8,7 @@ need to change the settings in one place.
 """
 import os, redis
 
-from bots.config.config_redis import (
+from config.config_redis import (
     REDIS_HOST, REDIS_PORT, REDIS_DB,
     PRE_PROC_KLINE_UPDATES,TRIGGER_QUEUE_CHANNEL
 ) 

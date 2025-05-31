@@ -24,13 +24,13 @@ Redis Channels Used:
 import json, threading, queue, time, signal, datetime, logging, os
 import websocket
 
-import bots.websocket_bot.config_websocket_bot as cfg
-from bots.utils import setup_logger, get_redis, send_heartbeat
-from bots.config import config_redis as r_cfg
-from bots.config import config_common as common_cfg
-from bots.websocket_bot.subscription_handler import SubscriptionHandler, MAX_SYMBOLS
-from bots.websocket_bot.message_router import MessageRouter
-from bots.websocket_bot.websocket_utils import send_webhook
+import config_websocket_bot as cfg
+from utils import setup_logger, get_redis, send_heartbeat
+from config import config_redis as r_cfg
+from config import config_common as common_cfg
+from subscription_handler import SubscriptionHandler, MAX_SYMBOLS
+from message_router import MessageRouter
+from websocket_utils import send_webhook
 
 # =====================================================
 # Jericho: Configurable Constants
@@ -47,6 +47,7 @@ class WebSocketBot(threading.Thread):
     Handles subscriptions, Redis sync, and message routing for spot/linear markets.
     """
     def __init__(self, market):
+        print("--------------------------------------------------------------- websocket_bot_core.py")
         """
         Initialize the WebSocketBot for a specific market type (e.g., 'spot', 'linear').
         Sets up logger, Redis, command queue, subscription handler, and background threads.
@@ -469,6 +470,28 @@ class WebSocketBot(threading.Thread):
                 self.router.orderbook(data)
         except Exception as exc:
             self.logger.error(f"Parse fail: {exc}  ¹ first 120 chars: {raw[:120]}")
+
+    def request_subscriptions_from_db(self):
+        """
+        Requests subscriptions from the database bot via Redis.
+        """
+        self.logger.info("Requesting subscriptions from the database bot...")
+        payload = json.dumps({"action": "request_subscriptions", "owner": self.market})
+        self.redis.publish(r_cfg.DB_REQUEST_SUBSCRIPTIONS, payload)
+
+    def subscribe_to_db_subscriptions(self):
+        """
+        Subscribes to the subscriptions retrieved from the database bot.
+        """
+        self.logger.info("Subscribing to database subscriptions...")
+        key = self._redis_key()
+        saved_subscriptions = self.redis.smembers(key)
+        if saved_subscriptions:
+            self.subscriptions = set(saved_subscriptions)
+            self._update_subscriptions()
+            self.logger.info(f"Subscribed to {len(saved_subscriptions)} subscriptions from the database bot.")
+        else:
+            self.logger.warning("No subscriptions found in Redis.")
 
 
 

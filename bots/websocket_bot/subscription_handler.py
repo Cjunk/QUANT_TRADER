@@ -1,7 +1,7 @@
 import json, threading, logging
-from bots.utils.redis_client import get_redis
-from bots.config import config_redis as cfg
-from bots.utils.logger import setup_logger
+from utils.redis_client import get_redis
+from config import config_redis as cfg
+from utils.logger import setup_logger
 
 # MAX_SYMBOLS is now the single source of truth for symbol limits, used by both SubscriptionHandler and WebSocketBot.
 MAX_SYMBOLS = 50  # Maximum allowed symbols per subscription
@@ -36,6 +36,7 @@ class SubscriptionHandler(threading.Thread):
                     self.logger.warning(f"❌ Subscription rejected: missing OWNER field. RAW: {cmd}")
                     continue
                 self.out_q.put(cmd)
+                self.redis.publish(cfg.DB_SAVE_SUBSCRIPTIONS, json.dumps(cmd))
                 self.logger.debug(f"✅ Sent command to out_q: {cmd}")
             except Exception as exc:
                 self.logger.error(f"Invalid command: {exc} RAW:{raw}")

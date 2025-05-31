@@ -1,8 +1,8 @@
 import json
 import datetime
 import os
-from bots.config import config_common
-from bots.utils.redis_client import get_redis
+from config import config_common
+from utils.redis_client import get_redis
 
 def send_heartbeat(payload: dict, status: str = "heartbeat"):
     """

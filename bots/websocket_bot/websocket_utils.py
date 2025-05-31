@@ -1,5 +1,5 @@
 import logging, requests
-from bots.websocket_bot.config_websocket_bot import LOG_LEVEL
+from config_websocket_bot import LOG_LEVEL
 
 
 def send_webhook(url, message):

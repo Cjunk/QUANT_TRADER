@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pb_bot_user
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: Quant_Trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  websocket_bot:
+    build:
+      context: .
+      dockerfile: bots/websocket_bot/Dockerfile
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    volumes:
+      - ./bots/websocket_bot:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+
+  db_bot:
+    build:
+      context: .
+      dockerfile: bots/db/Dockerfile
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: Quant_Trading
+      DB_USER: pb_bot_user
+      DB_PASSWORD: test
+      DB_TRADING_SCHEMA: trading
+    volumes:
+      - ./bots/db:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+
+  preprocessor_bot:
+    build:
+      context: .
+      dockerfile: bots/preprocessor/Dockerfile
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    volumes:
+      - ./bots/preprocessor:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+
+  macro_metrics:
+    build:
+      context: .
+      dockerfile: bots/macro_metrics/Dockerfile
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    volumes:
+      - ./bots/macro_metrics:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+  trigger_bot:
+    build:
+      context: .
+      dockerfile: bots/trigger/Dockerfile
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: Quant_Trading
+      DB_USER: pb_bot_user
+      DB_PASSWORD: test
+      DB_TRADING_SCHEMA: trading      
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    volumes:
+      - ./bots/trigger:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+volumes:
+  postgres-data:
+  redis-data:

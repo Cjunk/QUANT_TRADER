@@ -176,7 +176,62 @@ class PostgresDBBot:
                     self.logger.warning(f"Failed to send self-heartbeat: {e}")
                 time.sleep(self.heartbeat_interval)
         threading.Thread(target=self_heartbeat, daemon=True).start()
+    def debug_db_connection(self):
+        """
+        Enhanced debugging utility: Print current DB, schema, user, search path, all schemas, all tables, and privileges.
+        """
+        try:
+            env_schema = os.getenv("DB_TRADING_SCHEMA")
+            print(f"[DEBUG] os.getenv('DB_TRADING_SCHEMA') = {env_schema!r}")
+            print(f"[DEBUG] self.schema = {self.schema!r}")
+            print(f"[DEBUG] Connection params: host={self.host}, port={self.port}, dbname={self.database}, user={self.user}")
 
+            with self.conn.cursor() as cur:
+                # Print current DB, user, and schema
+                cur.execute("SELECT current_user, current_database(), current_schema();")
+                user, db, schema = cur.fetchone()
+                print(f"[DEBUG] Connected as user: {user}")
+                print(f"[DEBUG] Connected to database: {db}")
+                print(f"[DEBUG] Current schema: {schema}")
+
+                # Show search path
+                cur.execute("SHOW search_path;")
+                search_path = cur.fetchone()[0]
+                print(f"[DEBUG] search_path: {search_path}")
+
+                # List all schemas
+                cur.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;")
+                schemas = [row[0] for row in cur.fetchall()]
+                print(f"[DEBUG] Schemas in database: {schemas}")
+
+                # List all tables in all schemas
+                cur.execute("""
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    ORDER BY table_schema, table_name;
+                """)
+                tables = cur.fetchall()
+                print(f"[DEBUG] All tables in database:")
+                for s, t in tables:
+                    print(f"  - {s}.{t}")
+
+                # Show privileges for current user on these tables in the target schema
+                cur.execute("""
+                    SELECT table_name, privilege_type
+                    FROM information_schema.table_privileges
+                    WHERE grantee = CURRENT_USER AND table_schema = %s
+                    ORDER BY table_name, privilege_type;
+                """, (self.schema,))
+                privs = cur.fetchall()
+                print(f"[DEBUG] Privileges for user '{self.user}' in schema '{self.schema}':")
+                for t, p in privs:
+                    print(f"  - {t}: {p}")
+
+        except Exception as e:
+            print(f"[DEBUG] Error during DB debug: {e}")
+
+# Call this after self._setup_postgres() in __init__ for debugging:
+# self.debug_db_connection()
     #   -----POSTGRESQL SETUP
     def _setup_postgres(self):
         self.host = os.getenv("DB_HOST")
@@ -193,14 +248,14 @@ class PostgresDBBot:
             user=self.user,
             password=self.password,
         )
-        self.conn.autocommit = False
+        self.conn.autocommit = True
 
         # ✅ Set schema on connection
         with self.conn.cursor() as cur:
             cur.execute(f"SET search_path TO {self.schema}")
 
         self.logger.info(f"Connected to PostgreSQL @ {self.host}:{self.port}/{self.database}") 
-   
+        self.debug_db_connection()
     #   -----REDIS SETUP
     def _setup_redis(self):
         while True:
@@ -229,7 +284,8 @@ class PostgresDBBot:
             config_redis.SERVICE_STATUS_CHANNEL,
             config_redis.MACRO_METRICS_CHANNEL,
             config_redis.REQUEST_COINS,
-            config_redis.DB_SAVE_SUBSCRIPTIONS
+            config_redis.DB_SAVE_SUBSCRIPTIONS,
+            config_redis.DB_REQUEST_SUBSCRIPTIONS
         )
         self.logger.info("Subscribed to Redis Pub/Sub channels.")
 
@@ -773,11 +829,18 @@ class PostgresDBBot:
         hashed_auth_token = hashlib.sha256(auth_token.encode()).hexdigest()
 
         # ✅ Auth Check
-        cursor.execute(f"""
-            SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth
-            WHERE bot_name = %s
-        """, (bot_name,))
-        row = cursor.fetchone()
+        try:
+            # ✅ Auth Check
+            cursor.execute(f"""
+                SELECT token FROM {db_config.DB_TRADING_SCHEMA}.bot_auth
+                WHERE bot_name = %s
+            """, (bot_name,))
+            row = cursor.fetchone()
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Failed auth query for '{bot_name}': {e}")
+            cursor.close()
+            return
 
         if not row:
             self.logger.warning(f"❗ No auth record found for bot '{bot_name}'")
@@ -790,25 +853,29 @@ class PostgresDBBot:
             cursor.close()
             return
 
-        # 🔄 Check if bot exists in bots table
-        cursor.execute(f"""
-            SELECT 1 FROM {db_config.DB_TRADING_SCHEMA}.bots
-            WHERE bot_name = %s
-        """, (bot_name,))
-        exists = cursor.fetchone()
-
-        if exists:
-            self.logger.info(f"📝 Updating bot '{bot_name}' status to '{status}' at {time_str}")
+        try:
+            # 🔄 Check if bot exists in bots table
             cursor.execute(f"""
-                UPDATE {db_config.DB_TRADING_SCHEMA}.bots
-                SET status = %s,
-                    last_updated = %s,
-                    metadata = %s
+                SELECT 1 FROM {db_config.DB_TRADING_SCHEMA}.bots
                 WHERE bot_name = %s
-            """, (status, time_str, json.dumps(meta), bot_name))
-            self.conn.commit()
-            self.logger.info(f"✅ Update committed for bot '{bot_name}'")
-        else:
-            self.logger.warning(f"⚠️ Bot '{bot_name}' not found in bots table. Skipping update.")
+            """, (bot_name,))
+            exists = cursor.fetchone()
 
-        cursor.close()
+            if exists:
+                self.logger.info(f"📝 Updating bot '{bot_name}' status to '{status}' at {time_str}")
+                cursor.execute(f"""
+                    UPDATE {db_config.DB_TRADING_SCHEMA}.bots
+                    SET status = %s,
+                        last_updated = %s,
+                        metadata = %s
+                    WHERE bot_name = %s
+                """, (status, time_str, json.dumps(meta), bot_name))
+                self.conn.commit()
+                self.logger.info(f"✅ Update committed for bot '{bot_name}'")
+            else:
+                self.logger.warning(f"⚠️ Bot '{bot_name}' not found in bots table. Skipping update.")
+        except Exception as e:
+            self.conn.rollback()
+            self.logger.error(f"❌ Failed status update for bot '{bot_name}': {e}")
+        finally:
+            cursor.close()

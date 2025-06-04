@@ -4,5 +4,11 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"hide-files.files": [
+			"venv",
+			"Archive",
+			".vscode"
+		]
+	}
 }

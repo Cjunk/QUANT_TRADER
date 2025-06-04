@@ -91,7 +91,6 @@ class PostgresDBBot:
         
         self.running = True
         self.subscribed_channels = set()
-        #self.bot_status = {}
         self.status_handler = BOTStatusHandler(self)
         self.heartbeat_timeout = HEARTBEAT_TIMEOUT_SECONDS
         self.heartbeat = HeartBeat(

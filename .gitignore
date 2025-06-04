@@ -11,3 +11,5 @@ SQL/
 mybot.code-workspace*
 .vscode
 QuantTradingBots*
+BIN
+.gitignore

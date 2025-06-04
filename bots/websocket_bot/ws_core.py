@@ -71,6 +71,7 @@ class WebSocketBot(threading.Thread):
             "linear": r_cfg.LINEAR_SUBSCRIPTION_CHANNEL,
             "derivatives": getattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL', None)
         }.get(self.market, r_cfg.SPOT_SUBSCRIPTION_CHANNEL)
+        self.logger.info(f"[DEBUG] SubscriptionHandler will listen on Redis channel: {subscription_channel}")
         self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q, subscription_channel=subscription_channel)
         self.sub_handler.start()
 
@@ -101,7 +102,8 @@ class WebSocketBot(threading.Thread):
         )
 
         # ==== Jericho: Startup State ====
-        self._load_subscriptions_from_redis()
+        self.logger.info(f"[DEBUG] WebSocketBot for market '{self.market}' initialized. Subscriptions Redis key: {self._redis_key()}")
+        self.load_subscriptions_from_db(5)
         self._connect_ws()
         threading.Thread(target=self._ws_watchdog, daemon=True).start()
 
@@ -289,6 +291,10 @@ class WebSocketBot(threading.Thread):
             return
         new_subs, curr_channels = self.subscriptions, set(self.channels)
         to_sub, to_unsub = new_subs - curr_channels, curr_channels - new_subs
+
+        # Debug: Log what we are about to subscribe/unsubscribe
+        self.logger.info(f"[DEBUG] _update_subscriptions: to_sub={to_sub}, to_unsub={to_unsub}, curr_channels={curr_channels}, new_subs={new_subs}")
+
         # Jericho: Reset sequence for new subscriptions
         for sub in to_sub:
             parts = sub.split(".")
@@ -301,6 +307,7 @@ class WebSocketBot(threading.Thread):
             self.logger.info(f"🚫 Unsubscribing from {len(to_unsub)} topics")
             for i in range(0, len(to_unsub), BATCH_SIZE):
                 batch = list(to_unsub)[i:i+BATCH_SIZE]
+                self.logger.info(f"[DEBUG] Sending unsubscribe batch: {batch}")
                 self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
                 self.logger.debug(f"Unsubscribed batch: {batch}")
             self.channels -= to_unsub
@@ -309,6 +316,7 @@ class WebSocketBot(threading.Thread):
             self.logger.info(f"✅ Subscribing to {len(to_sub)} new topics")
             for i in range(0, len(to_sub), BATCH_SIZE):
                 batch = list(to_sub)[i:i+BATCH_SIZE]
+                self.logger.info(f"[DEBUG] Sending subscribe batch: {batch}")
                 self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
                 self.logger.debug(f"Subscribed batch: {batch}")
             self.channels |= to_sub
@@ -391,20 +399,20 @@ class WebSocketBot(threading.Thread):
         try:
             data = json.loads(raw)
             topic = data.get("topic", "")
+            self.logger.debug(f"[DEBUG] Received WS message: topic={topic} raw={raw[:200]}")
             if "kline" in topic:
                 _, interval, symbol = topic.split(".")
-                # Only log at debug here; info-level log will be in MessageRouter.kline for confirmed klines
-                self.logger.debug(f"KLINE  ¹ {symbol} {interval}")
+                #self.logger.info(f"[DEBUG] KLINE DATA RECEIVED: symbol={symbol} interval={interval} data={data}")
                 # --- Kline counter ---
                 if not hasattr(self, "kline_count"):
                     self.kline_count = 0
                 self.kline_count += 1
             elif "orderbook" in topic:
                 _, depth, symbol = topic.split(".")
-                self.logger.debug(f"ORDERBOOK  ¹ {symbol} depth {depth}")
+                #self.logger.info(f"[DEBUG] ORDERBOOK DATA RECEIVED: symbol={symbol} depth={depth} data={data}")
             elif "publicTrade" in topic:
                 _, symbol = topic.split(".")
-                self.logger.debug(f"TRADE  ¹ {symbol}")
+                #self.logger.info(f"[DEBUG] TRADE DATA RECEIVED: symbol={symbol} data={data}")
             # Jericho: SEQ GAP Debugging (remove when resolved)
             if "orderbook" in topic and "seq_gap" in data.get("type", "").lower():
                 symbol = data.get("symbol", "?")
@@ -413,10 +421,13 @@ class WebSocketBot(threading.Thread):
                 self.logger.debug(f"[DEBUG][SEQ GAP] symbol={symbol} last_seq={last_seq} new_seq={new_seq} raw={raw[:200]}")
             # Jericho: Route message
             if "publicTrade" in topic:
+                #self.logger.info(f"[DEBUG] Routing trade data to MessageRouter for symbol={symbol}")
                 self.router.trade(data)
             elif "kline" in topic:
+                #self.logger.info(f"[DEBUG] Routing kline data to MessageRouter for symbol={symbol}")
                 self.router.kline(data)
             elif "orderbook" in topic:
+                #self.logger.info(f"[DEBUG] Routing orderbook data to MessageRouter for symbol={symbol}")
                 self.router.orderbook(data)
         except Exception as exc:
             self.logger.error(f"Parse fail: {exc}  ¹ first 120 chars: {raw[:120]}")
@@ -442,6 +453,27 @@ class WebSocketBot(threading.Thread):
             self.logger.info(f"Subscribed to {len(saved_subscriptions)} subscriptions from the database bot.")
         else:
             self.logger.warning("No subscriptions found in Redis.")
+
+    def load_subscriptions_from_db(self, timeout=5):
+        """
+        Requests subscriptions from the database bot and loads them from Redis.
+        Waits up to `timeout` seconds for the DB bot to respond.
+        """
+        self.logger.info("Requesting subscriptions from the database bot...")
+        payload = json.dumps({"action": "request_subscriptions", "owner": self.market})
+        self.redis.publish(r_cfg.DB_REQUEST_SUBSCRIPTIONS, payload)
+
+        key = self._redis_key()
+        start = time.time()
+        while time.time() - start < timeout:
+            saved = self.redis.smembers(key)
+            if saved:
+                self.subscriptions = set(saved)
+                self.logger.info(f"🔄 Loaded subscriptions from DB via Redis: {self.market} {self.subscriptions}")
+                self.log_current_subscriptions()
+                return
+            time.sleep(0.5)
+        self.logger.warning(f"⚠️ No subscriptions found in Redis for {self.market} after {timeout} seconds.")
 
 
 

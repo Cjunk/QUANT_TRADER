@@ -14,7 +14,7 @@ class BOTStatusHandler:
         time_str = status_obj.get("time")
         meta = status_obj.get("metadata", {})
         auth_token = status_obj.get("auth_token")
-        self.bot.logger.info(f"📨 Received status update for bot: {bot_name}")
+        #self.bot.logger.info(f"📨 Received status update for bot: {bot_name}")
         self.bot.logger.debug(f"Status object: {json.dumps(status_obj, indent=2)}")
 
         if not all([bot_name, status, time_str, auth_token]):
@@ -54,7 +54,7 @@ class BOTStatusHandler:
             exists = cursor.fetchone()
 
             if exists:
-                self.bot.logger.info(f"📝 Updating bot '{bot_name}' status to '{status}' at {time_str}")
+                #self.bot.logger.info(f"📝 Updating bot '{bot_name}' status to '{status}' at {time_str}")
                 cursor.execute(f"""
                     UPDATE {db_config.DB_TRADING_SCHEMA}.bots
                     SET status = %s,
@@ -63,7 +63,7 @@ class BOTStatusHandler:
                     WHERE bot_name = %s
                 """, (status, time_str, json.dumps(meta), bot_name))
                 self.bot.conn.commit()
-                self.bot.logger.info(f"✅ Update committed for bot '{bot_name}'")
+                #self.bot.logger.info(f"✅ Update committed for bot '{bot_name}'")
             else:
                 self.bot.logger.warning(f"⚠️ Bot '{bot_name}' not found in bots table. Skipping update.")
         except Exception as e:

@@ -87,7 +87,7 @@ class PostgresDBBot:
         self.pubsub = self.redis_handler.pubsub
         self.logger.info("Redis setup complete.")
         
-        self.Klinehandler = KlineHandler(self.conn, self.logger)
+        
         
         self.running = True
         self.subscribed_channels = set()
@@ -103,6 +103,10 @@ class PostgresDBBot:
         )
         self.logger.info("Initializing PostgresDBBot...")
         self.conn = self.db.conn
+        self.Klinehandler = KlineHandler(self.conn, self.logger)
+        if self.conn is None:
+            self.logger.error("❌ Database connection failed! Exiting.")
+            raise RuntimeError("Database connection failed")
                 # --- Fix data gaps at startup ---
         try:
             fix_all_data_gaps(self)
@@ -128,24 +132,45 @@ class PostgresDBBot:
             try:
                 message = self.redis_handler.get_message(timeout=1)
                 if message:
+                    if self.conn is None:
+                        self.logger.error("❌ DB connection is None before DB operation!")
                     channel = message['channel']
                     data_str = message['data']
+                    self.logger.info(f"[DEBUG] Received Redis message on channel: {channel} | data: {data_str}")
                     try:
                         data_obj = json.loads(data_str)
                     except json.JSONDecodeError:
-                        self.logger.error(f"Invalid JSON from channel={channel}: {data_str}")
+                        self.logger.error(f"[DEBUG] Invalid JSON from channel={channel}: {data_str}")
                         continue
-                    self._route_redis_message(channel, data_obj, message)
+                    try:
+                        self._route_redis_message(channel, data_obj, message)
+                    except Exception as route_exc:
+                        self.logger.error(f"[DEBUG] Exception in _route_redis_message: {route_exc}", exc_info=True)
+                        # Check connection state before any rollback
+                        if hasattr(self, 'conn'):
+                            self.logger.error(f"[DEBUG] self.conn is: {self.conn}")
+                            if self.conn is None:
+                                self.logger.error("[DEBUG] self.conn is None inside _route_redis_message exception handler!")
+                            else:
+                                try:
+                                    self.conn.rollback()
+                                    self.logger.error("[DEBUG] Performed rollback after exception in _route_redis_message.")
+                                except Exception as rb_exc:
+                                    self.logger.error(f"[DEBUG] Rollback itself failed: {rb_exc}", exc_info=True)
+                        else:
+                            self.logger.error("[DEBUG] self.conn attribute does not exist!")
             except Exception as e:
-                self.logger.error(f"❌ Redis listener error: {e}")
+                self.logger.error(f"❌ Redis listener error (outer): {e}", exc_info=True)
                 time.sleep(2)
 
     def _route_redis_message(self, channel, data_obj, raw_message):
         if channel == config_redis.PRE_PROC_KLINE_UPDATES:
             self.Klinehandler.handle_kline_update(data_obj)
         elif channel == config_redis.DB_REQUEST_SUBSCRIPTIONS:
-            self.logger.info("Requesting subscriptions from the db")
-            self.handle_request_subscriptions(data_obj)
+            market = data_obj.get("market") or data_obj.get("owner")
+            if market:
+                self.logger.info(f"Publishing websocket subscriptions for market '{market}' to Redis set.")
+                self.publish_websocket_subscriptions(market)
         elif channel == config_redis.DB_SAVE_SUBSCRIPTIONS:
             data = json.loads(raw_message['data'])
             self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
@@ -167,38 +192,6 @@ class PostgresDBBot:
             self._publish_current_coin_list()
         else:
             self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
-
-    def handle_request_subscriptions(self, data):
-        market_filter = data.get("market")
-        cur = self.conn.cursor()
-        rows = []
-        query = """
-                SELECT * FROM trading.websocket_subscriptions WHERE market = %s;
-                """
-        try:
-            cur.execute(query, (market_filter,))
-            rows = cur.fetchall()
-            self.logger.info(f"Retrieved {len(rows)} saved subscriptions for market '{market_filter}' from DB.")
-        except Exception as e:
-            self.logger.error(f"Error retrieving subscriptions from DB: {e}")   
-        finally:
-            cur.close()
-
-        if rows:
-            subscriptions = []
-            for row in rows:
-                market, symbol, topic, owner = row
-                subscriptions.append({
-                    "market": market,
-                    "symbol": symbol,
-                    "topic": topic,
-                    "owner": owner
-                })
-            payload = json.dumps(subscriptions)
-            self.redis_handler.publish(config_redis.DB_REQUEST_SUBSCRIPTIONS, payload)
-            self.logger.info(f"Published {len(subscriptions)} subscriptions to {config_redis.DB_REQUEST_SUBSCRIPTIONS} channel.")
-        else:
-            self.logger.info(f"No saved subscriptions found for market '{market_filter}' in DB.")
 
     def save_subscription(self,market: str, symbols: list, topics: list, owner: str):
         if not owner:
@@ -267,7 +260,8 @@ class PostgresDBBot:
             cursor.execute(insert_sql, (symbol, price, volume, side))
             self.conn.commit()
         except Exception as e:
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             self.logger.error(f"Error inserting order book data: {e}")
         finally:
             cursor.close()
@@ -285,7 +279,8 @@ class PostgresDBBot:
             self.conn.commit()
         except Exception as e:
             self.logger.error(f"Error storing symbols: {e}")
-            self.conn.rollback()  
+            if self.conn:
+                self.conn.rollback()
 
     def handle_coin_list_update(self,cdata):
         conn = self.conn
@@ -309,7 +304,8 @@ class PostgresDBBot:
             self.conn.commit()
             self.logger.debug(f"✅ Updated last_seen for {bot_name} at {timestamp}")
         except Exception as e:
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             self.logger.error(f"❌ Failed to update last_seen for {bot_name}: {e}")
         finally:
             cursor.close()
@@ -369,7 +365,8 @@ class PostgresDBBot:
             self.conn.commit()
             self.logger.info(f"🔴 Marked {bot_name} as stopped in DB at {timestamp}")
         except Exception as e:
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             self.logger.error(f"❌ Failed to mark {bot_name} as stopped: {e}")
         finally:
             cursor.close()
@@ -413,7 +410,8 @@ class PostgresDBBot:
                     inserted = cursor.rowcount
                     self.trade_buffer.clear()
                 except Exception as e:
-                    self.conn.rollback()
+                    if self.conn:
+                        self.conn.rollback()
                     self.logger.error(f" Error during bulk insert of trades: {e}")
                 finally:
                     cursor.close()
@@ -458,7 +456,8 @@ class PostgresDBBot:
             cursor.close()
             self.logger.info(f"✅ Inserted macro metric @ {data['timestamp']}")
         except Exception as e:
-            self.conn.rollback()
+            if self.conn:
+                self.conn.rollback()
             self.logger.error(f"❌ Error inserting macro metric: {e}")
 
     def _load_initial_bot_status(self):
@@ -485,11 +484,56 @@ class PostgresDBBot:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            f"SELECT * FROM {self.trading_schema}.websocket_subscriptions WHERE market = %s",
+            f"SELECT * FROM {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions WHERE market = %s",
             (market,)
         )
         rows = cursor.fetchall()
         cursor.close()
         # Convert rows to dicts if needed
         return [dict(zip([desc[0] for desc in cursor.description], row)) for row in rows]
+
+    def publish_websocket_subscriptions(self, market: str):
+        """
+        Fetch websocket subscriptions for a given market and publish them as a single JSON object
+        to the correct Redis list, matching the manual lpush format.
+        """
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT symbol, topic, owner FROM {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions WHERE market = %s",
+                (market,)
+            )
+            rows = cur.fetchall()
+            symbols = set()
+            topics = set()
+            owner = None
+            for symbol, topic, row_owner in rows:
+                symbols.add(symbol)
+                if isinstance(topic, str):
+                    try:
+                        topic_list = json.loads(topic)
+                        topics.update(topic_list if isinstance(topic_list, list) else [topic_list])
+                    except Exception:
+                        topics.add(topic)
+                else:
+                    topics.add(topic)
+                if not owner and row_owner:
+                    owner = row_owner
+            if symbols and topics:
+                payload = json.dumps({
+                    "action": "set",
+                    "owner": owner or "db_bot",
+                    "market": market,
+                    "symbols": sorted(list(symbols)),
+                    "topics": sorted(list(topics))
+                })
+                # Push to the correct Redis list
+                redis_list = f"{market}_coin_subscriptions"
+                self.redis_handler.client.lpush(redis_list, payload)
+            else:
+                self.logger.info(f"No websocket subscriptions found for market '{market}'. Redis list not updated.")
+        except Exception as e:
+            self.logger.error(f"Error publishing websocket subscriptions: {e}")
+        finally:
+            cur.close()
 

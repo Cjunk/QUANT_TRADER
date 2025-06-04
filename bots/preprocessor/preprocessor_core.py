@@ -105,9 +105,6 @@ class PreprocessorBot:
         self.pubsub.subscribe(*channels_to_sub)
         self.logger.info(f"✅ Connected to Redis and subscribed to: {channels_to_sub}")
 
-    # =========================
-    # Redis Listening & Message Routing
-    # =========================
     def _listen_redis(self):
         """
         Listen to Redis channels and route messages for processing.
@@ -116,7 +113,14 @@ class PreprocessorBot:
             try:
                 message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
                 if message and message['type'] == 'message':
-                    self._route_message(message['channel'], json.loads(message['data']))
+                    self.logger.info(f"[DEBUG] Received message on channel: {message['channel']}")
+                    try:
+                        payload = json.loads(message['data'])
+                        #self.logger.info(f"[DEBUG] Payload received: {payload}")
+                    except Exception as e:
+                        self.logger.error(f"[DEBUG] Failed to decode JSON payload: {e} RAW: {message['data']}")
+                        continue
+                    self._route_message(message['channel'], payload)
             except Exception as e:
                 self.logger.error(f"❌ Failed to handle Redis message: {e}")
 
@@ -124,16 +128,21 @@ class PreprocessorBot:
         """
         Route incoming Redis messages to the appropriate handler based on channel.
         """
+        #self.logger.info(f"[DEBUG] Routing message from channel: {channel} payload: {payload}")
         for market, chans in self.market_channels.items():
             if chans["kline"] == channel:
+                self.logger.info(f"[DEBUG] Detected kline channel for market: {market}")
                 self._process_kline(payload, market)
                 return
-            if chans["trade"] == channel:
-                self._process_trade(payload, market)
-                return
-            if chans["orderbook"] == channel:
-                self._process_orderbook(payload, market)
-                return
+            # Comment out trade and orderbook processing for now
+            # if chans["trade"] == channel:
+            #     self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
+            #     self._process_trade(payload, market)
+            #     return
+            # if chans["orderbook"] == channel:
+            #     self.logger.info(f"[DEBUG] Detected orderbook channel for market: {market}")
+            #     self._process_orderbook(payload, market)
+            #     return
 
     # =========================
     # Trade Window Management
@@ -206,17 +215,19 @@ class PreprocessorBot:
         Process a kline message, enrich it, and publish the result.
         Also updates the klines_processed counter for the market.
         """
+        self.logger.info(f"[DEBUG] Processing kline for {market}: {payload}")
         symbol, interval = payload['symbol'], payload['interval']
         key = (symbol, interval, market)
         redis_key = f"kline_window:{market}:{symbol}:{interval}"
 
         if key not in self.kline_windows:
+            self.logger.info(f"[DEBUG] Preloading kline window for {key}")
             self._preload_kline_window(symbol, interval, market)
 
         if self.kline_windows[key]:
             last = self.kline_windows[key][-1]
             if last['start_time'] == payload['start_time'] and last['close'] == payload['close']:
-                self.logger.debug(f"🔁 Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
+                self.logger.info(f"[DEBUG] Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
                 return
 
         payload['market'] = market
@@ -236,6 +247,7 @@ class PreprocessorBot:
             self.klines_processed[market] += 1  # Track per market
             self.status["metadata"]["vitals"]["klines_processed"] = self.klines_processed.copy()  # Update for heartbeat
             out_channel = config_redis.PRE_PROC_KLINE_UPDATES
+            self.logger.info(f"[DEBUG] Publishing enriched kline to {out_channel}: {enriched_kline}")
             self.redis_handler.publish(out_channel, json.dumps(enriched_kline))
         except Exception as e:
             self.logger.error(f"❌ Error processing kline for {market}: {e}")

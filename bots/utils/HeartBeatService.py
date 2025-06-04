@@ -28,7 +28,7 @@ class HeartBeat:
                     "metadata": self.metadata
                 }
                 self.redis_handler.publish(self.channel, json.dumps(payload))
-                self.logger.info(f"Heartbeat sent for {self.bot_name} at {payload['time']}, published on REDIS on channel {self.channel} with {payload['metadata']}")
+                #self.logger.info(f"Heartbeat sent for {self.bot_name} at {payload['time']}, published on REDIS on channel {self.channel} with {payload['metadata']}")
             except Exception as e:
                 self.logger.warning(f"Failed to send heartbeat: {e}")
 

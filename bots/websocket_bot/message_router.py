@@ -38,8 +38,8 @@ class MessageRouter:
                 "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat()
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
-            self.redis.publish(channel, json.dumps(trade_data))
-            self.logger.debug(f"Published trade: {trade_data}")
+            #self.redis.publish(channel, json.dumps(trade_data))
+            #self.logger.debug(f"Published trade: {trade_data}")
         except Exception as exc:
             self.logger.error(f"trade() parse error: {exc}  RAW={data}")
 
@@ -112,7 +112,7 @@ class MessageRouter:
                 }
                 self.redis.publish(r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_out"], json.dumps(aggregated_payload))
                 self._last_published_time[sym] = now
-                self.logger.debug(f"Published orderbook: {aggregated_payload}")
+                #self.logger.debug(f"Published orderbook: {aggregated_payload}")
         except Exception as exc:
             snippet = str(raw)[:120]
             self.logger.error("OB-parse error: %s raw:%s…", exc, snippet)

@@ -30,16 +30,20 @@ class MessageRouter:
     def trade(self, data):
         try:
             trade = data["data"][-1]
+            taker_side = trade["S"]
             trade_data = {
                 "symbol": trade["s"],
                 "price": float(trade["p"]),
                 "volume": float(trade["v"]),
                 "side": trade["S"],
-                "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat()
+                "trade_time": datetime.datetime.utcfromtimestamp(trade["T"]/1000).isoformat(),
+                "market": self.market,
+                "trade_id": trade.get("i"),  # <-- Add this
+                "is_buyer_maker": True if taker_side == "Sell" else False  # Inferred logic
             }
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.trade_out"]
-            #self.redis.publish(channel, json.dumps(trade_data))
-            #self.logger.debug(f"Published trade: {trade_data}")
+            self.redis.publish(channel, json.dumps(trade_data))
+            self.logger.debug(f"Published trade: {trade_data}")
         except Exception as exc:
             self.logger.error(f"trade() parse error: {exc}  RAW={data}")
 
@@ -66,7 +70,7 @@ class MessageRouter:
             channel = r_cfg.REDIS_CHANNEL[f"{self.market}.kline_out"]
             self.redis.publish(channel, json.dumps(out))
             self.logger.info(f"KLINE {interval} → {sym} {interval}")
-            self.logger.debug(f"Published kline: {out}")
+            #self.logger.debug(f"Published kline: {out}")
         except Exception as exc:
             self.logger.error(f"kline() parse error: {exc}  RAW={msg}")
 

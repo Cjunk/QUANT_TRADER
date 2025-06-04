@@ -135,10 +135,10 @@ class PreprocessorBot:
                 self._process_kline(payload, market)
                 return
             # Comment out trade and orderbook processing for now
-            # if chans["trade"] == channel:
-            #     self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
-            #     self._process_trade(payload, market)
-            #     return
+            if chans["trade"] == channel:
+                self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
+                self._process_trade(payload, market)
+                return
             # if chans["orderbook"] == channel:
             #     self.logger.info(f"[DEBUG] Detected orderbook channel for market: {market}")
             #     self._process_orderbook(payload, market)
@@ -264,6 +264,11 @@ class PreprocessorBot:
                 "price": payload['price'],
                 "volume": payload['volume']
             })
+        
+            # 🔥 Emit full trade delta to DB via Redis
+            payload["market"] = market
+            self.redis_handler.publish(config_redis.RAW_TRADE_CHANNEL, json.dumps(payload))
+            self.logger.debug(f"📤 Published raw trade for {symbol} at {payload['price']}")
         except Exception as e:
             self.logger.error(f"❌ Error processing trade: {e}")
 

@@ -80,15 +80,13 @@ class PostgresDBBot:
             config_redis.SERVICE_STATUS_CHANNEL,
             config_redis.MACRO_METRICS_CHANNEL,
             config_redis.REQUEST_COINS,
+            config_redis.RAW_TRADE_CHANNEL,
             config_redis.DB_SAVE_SUBSCRIPTIONS,
             config_redis.DB_REQUEST_SUBSCRIPTIONS])
         self.logger.info("Redis connected and subscribed to channels.")
         self.redis_client = self.redis_handler.client
         self.pubsub = self.redis_handler.pubsub
         self.logger.info("Redis setup complete.")
-        
-        
-        
         self.running = True
         self.subscribed_channels = set()
         self.status_handler = BOTStatusHandler(self)
@@ -175,6 +173,8 @@ class PostgresDBBot:
             self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
         elif channel == config_redis.MACRO_METRICS_CHANNEL:
             self.handle_macro_metrics(data_obj)
+        elif channel == config_redis.RAW_TRADE_CHANNEL:
+            self.handle_raw_trade(data_obj)
         elif channel == config_redis.PRE_PROC_TRADE_CHANNEL:
             self.handle_trade_update(data_obj)
         elif channel == config_redis.PRE_PROC_ORDER_BOOK_UPDATES:
@@ -191,6 +191,33 @@ class PostgresDBBot:
             self._publish_current_coin_list()
         else:
             self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
+    def handle_raw_trade(self, tdata):
+        try:
+            cursor = self.conn.cursor()
+            insert_sql = f"""
+            INSERT INTO {db_config.DB_TRADING_SCHEMA}.raw_trade_data 
+            (symbol, market, trade_time, price, volume, side, is_buyer_maker, trade_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_sql, (
+                tdata["symbol"],
+                tdata["market"],
+                pd.to_datetime(tdata["trade_time"]),
+                float(tdata["price"]),
+                float(tdata["volume"]),
+                tdata.get("side"),
+                tdata.get("is_buyer_maker"),
+                tdata.get("trade_id")
+            ))
+            self.conn.commit()
+            cursor.close()
+            self.logger.debug(f"✅ Inserted trade ID {tdata.get('trade_id')} for {tdata['symbol']} at {tdata['price']}")
+        except Exception as e:
+            if self.conn:
+                self.conn.rollback()
+            self.logger.error(f"🚨 Failed to insert raw_trade_data: {e}")
+
+
 
     def save_subscription(self,market: str, symbols: list, topics: list, owner: str):
         if not owner:

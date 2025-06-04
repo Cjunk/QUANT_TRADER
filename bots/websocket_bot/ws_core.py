@@ -25,7 +25,9 @@ import json, threading, queue, time, signal, datetime, logging, os
 import websocket
 
 import config_websocket_bot as cfg
-from utils import setup_logger, get_redis, send_heartbeat
+from utils import setup_logger, get_redis
+from utils.redis_handler import RedisHandler
+from utils.HeartBeatService import HeartBeat
 from config import config_redis as r_cfg
 from config import config_common as common_cfg
 from subscription_handler import SubscriptionHandler, MAX_SYMBOLS
@@ -47,21 +49,14 @@ class WebSocketBot(threading.Thread):
     Handles subscriptions, Redis sync, and message routing for spot/linear markets.
     """
     def __init__(self, market):
-        print("--------------------------------------------------------------- websocket_bot_core.py")
-        """
-        Initialize the WebSocketBot for a specific market type (e.g., 'spot', 'linear').
-        Sets up logger, Redis, command queue, subscription handler, and background threads.
-        Loads any existing subscriptions from Redis and connects to the WebSocket.
-        Args:
-            market (str): The market type this bot will operate on.
-        """
         super().__init__(daemon=True)
-        # ==== Jericho: Core State ====
         self.market = market
         # Set up logger with correct log file and level
         log_level = logging.DEBUG if getattr(cfg, "LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
         self.logger = setup_logger(f"{market}_ws_core.log", log_level)
-        self.redis = get_redis()
+        self.redis_handler = RedisHandler(r_cfg, self.logger)
+        self.redis_handler.connect()
+        self.redis = self.redis_handler.client
         self.cmd_q = queue.Queue()
         self.ws = None
         self.subscriptions = set()
@@ -74,30 +69,14 @@ class WebSocketBot(threading.Thread):
         subscription_channel = {
             "spot": r_cfg.SPOT_SUBSCRIPTION_CHANNEL,
             "linear": r_cfg.LINEAR_SUBSCRIPTION_CHANNEL,
-            "derivatives": r_cfg.DERIVATIVES_SUBSCRIPTION_CHANNEL if hasattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL') else None
+            "derivatives": getattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL', None)
         }.get(self.market, r_cfg.SPOT_SUBSCRIPTION_CHANNEL)
         self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q, subscription_channel=subscription_channel)
         self.sub_handler.start()
 
-        # ==== Jericho: Background Threads ====
-        threading.Thread(target=self._heartbeat, daemon=True).start()
-        threading.Thread(target=self._ws_watchdog, daemon=True).start()
-
-        # ==== Jericho: Startup State ====
-        self._load_subscriptions_from_redis()
-        self._connect_ws()
-
-    # =====================================================
-    # Jericho: Main Run Loop
-    # =====================================================
-    def run(self):
-        """
-        Main thread loop for the WebSocketBot.
-        Publishes a 'started' status, sends a Discord webhook, and processes commands from the queue.
-        Exits cleanly when the exit event is set.
-        """
-        started_payload = {
-            "bot_name": cfg.BOT_NAME,
+        # Heartbeat setup
+        self.status = {
+            "bot_name": f"{cfg.BOT_NAME}:{self.market}",
             "status": "started",
             "time": datetime.datetime.utcnow().isoformat(),
             "auth_token": cfg.BOT_AUTH_TOKEN,
@@ -107,13 +86,33 @@ class WebSocketBot(threading.Thread):
                 "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
                 "vitals": {
                     "market": self.market,
-                    "subscriptions": sorted(list(self.subscriptions)) if self.subscriptions else [],
+                    "subscriptions": sorted(list(self.subscriptions)),
                     "kline_count": getattr(self, "kline_count", 0),
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                 }
             }
         }
-        self.redis.publish(r_cfg.SERVICE_STATUS_CHANNEL, json.dumps(started_payload))
+        self.heartbeat = HeartBeat(
+            bot_name=f"{cfg.BOT_NAME}:{self.market}",
+            auth_token=cfg.BOT_AUTH_TOKEN,
+            logger=self.logger,
+            redis_handler=self.redis_handler,
+            metadata=self.status
+        )
+
+        # ==== Jericho: Startup State ====
+        self._load_subscriptions_from_redis()
+        self._connect_ws()
+        threading.Thread(target=self._ws_watchdog, daemon=True).start()
+
+    # =====================================================
+    # Jericho: Main Run Loop
+    # =====================================================
+    def run(self):
+        """
+        Main thread loop for the WebSocketBot.
+        Processes commands from the queue and exits cleanly when the exit event is set.
+        """
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot started.")
         self.logger.info(f"🚀 WebSocketBot running. {self.market}")
         while not self.exit_evt.is_set():
@@ -130,8 +129,7 @@ class WebSocketBot(threading.Thread):
     def stop(self):
         """
         Cleanly shuts down the WebSocketBot.
-        Closes the WebSocket, stops the subscription handler, saves subscriptions to Redis,
-        and publishes a 'stopped' status update.
+        Closes the WebSocket, stops the subscription handler, and saves subscriptions to Redis.
         """
         if self.exit_evt.is_set(): return
         self.logger.info("🛑 Shutting down...")
@@ -144,26 +142,6 @@ class WebSocketBot(threading.Thread):
                 self.logger.warning(f"⚠️ WebSocket close failed: {e}")
         if self.sub_handler: self.sub_handler.stop()
         self._save_subscriptions_to_redis()
-        # --- Send shutdown status to DB bot ---
-        subs_list = sorted(list(self.subscriptions)) if self.subscriptions else []
-        shutdown_payload = {
-            "bot_name": cfg.BOT_NAME,
-            "status": "stopped",
-            "time": datetime.datetime.utcnow().isoformat(),
-            "auth_token": cfg.BOT_AUTH_TOKEN,
-            "metadata": {
-                "version": getattr(cfg, "VERSION", "1.0.0"),
-                "pid": os.getpid(),
-                "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
-                "vitals": {
-                    "market": self.market,
-                    "subscriptions": subs_list,
-                    "kline_count": getattr(self, "kline_count", 0),
-                    "timestamp": datetime.datetime.utcnow().isoformat(),
-                }
-            }
-        }
-        self.redis.publish(r_cfg.SERVICE_STATUS_CHANNEL, json.dumps(shutdown_payload))
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
         self.logger.info("✅ Shutdown complete.")
 
@@ -398,34 +376,6 @@ class WebSocketBot(threading.Thread):
             if self.ws and self.ws.sock and self.ws.sock.connected:
                 self._flush_pending()
             self.exit_evt.wait(5)
-
-    def _heartbeat(self):
-        """
-        Periodically sends a heartbeat payload to Redis and logs vital stats.
-        Uses the shared send_heartbeat utility for consistency across bots.
-        """
-        while not self.exit_evt.is_set():
-            vital_info = {
-                "market": self.market,
-                "subscriptions": sorted(list(self.subscriptions)) if self.subscriptions else [],
-                "kline_count": getattr(self, "kline_count", 0),
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-            }
-            payload = {
-                "bot_name": cfg.BOT_NAME,
-                "heartbeat": True,
-                "time": datetime.datetime.utcnow().isoformat(),
-                "auth_token": cfg.BOT_AUTH_TOKEN,
-                "metadata": {
-                    "version": getattr(cfg, "VERSION", "1.0.0"),
-                    "pid": os.getpid(),
-                    "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
-                    "vitals": vital_info
-                }
-            }
-            send_heartbeat(payload, status="heartbeat")
-            self.logger.debug(f"❤️ Sent heartbeat. Vitals: {vital_info}")
-            self.exit_evt.wait(common_cfg.HEARTBEAT_INTERVAL_SECONDS)
 
     # =====================================================
     # Jericho: WebSocket Message Handler

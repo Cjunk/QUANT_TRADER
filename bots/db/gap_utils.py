@@ -9,7 +9,31 @@ import datetime
 import pandas as pd
 import requests
 import config.config_db as db_config
-
+def fix_all_data_gaps(db_bot):
+    """
+    Runs fix_data_gaps for all symbols and all intervals.
+    """
+    INTERVAL_MAP = getattr(db_bot, 'INTERVAL_MAP', {"1": 1, "5": 5, "60": 60, "D": 1440})
+    symbols = retrieve_symbols(db_bot)
+    for symbol in symbols:
+        for interval in INTERVAL_MAP:
+            db_bot.logger.info(f"Checking and fixing data gaps for {symbol} interval {interval}")
+            fix_data_gaps(db_bot, symbol, interval)
+    db_bot.logger.info("Gap fixing complete for all symbols and intervals.")
+def retrieve_symbols(db_bot):
+    """
+    Returns a list of unique symbols from the kline_data table.
+    """
+    cursor = db_bot.conn.cursor()
+    try:
+        cursor.execute(f"SELECT DISTINCT symbol FROM {db_config.DB_TRADING_SCHEMA}.kline_data")
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
+    except Exception as e:
+        db_bot.logger.error(f"Error retrieving symbols: {e}")
+        return []
+    finally:
+        cursor.close()
 def fix_data_gaps(db_bot, symbol, interval, lookback=5000):
     """
     Checks for missing klines in the DB and fills them using Bybit API.

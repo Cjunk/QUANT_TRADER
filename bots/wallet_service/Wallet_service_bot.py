@@ -1,31 +1,22 @@
 # 📦 Wallet Service Bot 
 # Location: templates/authenticated_bot_template/
 
-import time,os
-import threading
-import json
-import redis
-import datetime
-import config.config_redis as config_redis
+import time, os, threading, json, datetime
 from utils.logger import setup_logger
+from utils.redis_handler import RedisHandler
+from utils.HeartBeatService import HeartBeat
 from config.config_wallet import BOT_NAME, BOT_AUTH_TOKEN
+import config.config_redis as config_redis
 
 class WalletService:
     def __init__(self, logger):
         self.bot_name = BOT_NAME
         self.auth_token = BOT_AUTH_TOKEN
         self.logger = logger
-        self.redis = redis.Redis(
-            host=config_redis.REDIS_HOST,
-            port=config_redis.REDIS_PORT,
-            db=config_redis.REDIS_DB,
-            decode_responses=True
-        )
+        self.redis_handler = RedisHandler(config_redis, self.logger)
+        self.redis_handler.connect()
         self.running = True
-        self.heartbeat_interval = 120  # seconds
-
-    def register(self):
-        payload = {
+        self.status = {
             "bot_name": self.bot_name,
             "status": "started",
             "time": datetime.datetime.utcnow().isoformat(),
@@ -34,24 +25,18 @@ class WalletService:
                 "version": "1.0",
                 "pid": os.getpid()
             }
-            
         }
-        self.redis.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(payload))
-        self.logger.info(f"🔐 Registered bot '{self.bot_name}' with status 'started'.")
+        self.heartbeat = HeartBeat(
+            bot_name=self.bot_name,
+            auth_token=self.auth_token,
+            logger=self.logger,
+            redis_handler=self.redis_handler,
+            metadata=self.status
+        )
 
-    def heartbeat(self):
-        while self.running:
-            try:
-                payload = {
-                    "bot_name": self.bot_name,
-                    "heartbeat": True,
-                    "time": datetime.datetime.utcnow().isoformat()
-                }
-                self.redis.publish(config_redis.HEARTBEAT_CHANNEL, json.dumps(payload))
-                self.logger.debug("❤️ Sent heartbeat.")
-            except Exception as e:
-                self.logger.warning(f"Heartbeat failed: {e}")
-            time.sleep(self.heartbeat_interval)
+    def register(self):
+        self.redis_handler.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(self.status))
+        self.logger.info(f"🔐 Registered bot '{self.bot_name}' with status 'started'.")
 
     def stop(self):
         self.running = False
@@ -62,14 +47,12 @@ class WalletService:
             "time": datetime.datetime.utcnow().isoformat(),
             "auth_token": self.auth_token
         }
-        self.redis.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(payload))
+        self.redis_handler.publish(config_redis.SERVICE_STATUS_CHANNEL, json.dumps(payload))
         self.logger.info(f"✅ Sent shutdown status for bot '{self.bot_name}'.")
 
     def run(self):
         self.logger.info(f"🚀 {self.bot_name} is running...")
         self.register()
-        threading.Thread(target=self.heartbeat, daemon=True).start()
-        
         try:
             while self.running:
                 # Main loop work goes here
@@ -78,3 +61,7 @@ class WalletService:
             self.stop()
         finally:
             self.logger.info("👋 Bot process exited.")
+
+if __name__ == "__main__":
+    logger = setup_logger("wallet_service.log")
+    WalletService(logger).run()

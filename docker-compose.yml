@@ -2,9 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: pb_bot_user
-      POSTGRES_PASSWORD: test
-      POSTGRES_DB: Quant_Trading
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5433:5432"
     volumes:
@@ -13,7 +13,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT}:${REDIS_PORT}"
     volumes:
       - redis-data:/data
 
@@ -25,10 +25,11 @@ services:
       - postgres
       - redis
     environment:
-      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
+      BOT_AUTH_TOKEN: ${WEBSOCKET_BOT_AUTH_TOKEN}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
     volumes:
       - ./bots/websocket_bot:/app
       - ./bots/utils:/app/utils
@@ -42,16 +43,17 @@ services:
       - postgres
       - redis
     environment:
-      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
+      BOT_AUTH_TOKEN: ${DB_BOT_AUTH_TOKEN}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_DATABASE: Quant_Trading
-      DB_USER: pb_bot_user
-      DB_PASSWORD: test
-      DB_TRADING_SCHEMA: trading
+      DB_DATABASE: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_TRADING_SCHEMA: ${DB_TRADING_SCHEMA}
     volumes:
       - ./bots/db:/app
       - ./bots/utils:/app/utils
@@ -65,10 +67,11 @@ services:
       - postgres
       - redis
     environment:
-      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
+      BOT_AUTH_TOKEN: ${PREPROCESSOR_BOT_AUTH_TOKEN}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
     volumes:
       - ./bots/preprocessor:/app
       - ./bots/utils:/app/utils
@@ -81,13 +84,15 @@ services:
     depends_on:
       - redis
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
+      BOT_AUTH_TOKEN: ${MACRO_SERVICES_BOT_AUTH_TOKEN}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
     volumes:
       - ./bots/macro_metrics:/app
       - ./bots/utils:/app/utils
       - ./bots/config:/app/config
+
   trigger_bot:
     build:
       context: .
@@ -96,20 +101,22 @@ services:
       - postgres
       - redis
     environment:
-      DATABASE_URL: postgres://pb_bot_user:test@postgres:5432/Quant_Trading
+      BOT_AUTH_TOKEN: ${TRIGGER_BOT_AUTH_TOKEN}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_DATABASE: Quant_Trading
-      DB_USER: pb_bot_user
-      DB_PASSWORD: test
-      DB_TRADING_SCHEMA: trading      
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
+      DB_DATABASE: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_TRADING_SCHEMA: ${DB_TRADING_SCHEMA}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
     volumes:
       - ./bots/trigger:/app
       - ./bots/utils:/app/utils
       - ./bots/config:/app/config
+
 volumes:
   postgres-data:
   redis-data:

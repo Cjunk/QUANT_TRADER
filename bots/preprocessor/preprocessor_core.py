@@ -113,7 +113,7 @@ class PreprocessorBot:
             try:
                 message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
                 if message and message['type'] == 'message':
-                    self.logger.info(f"[DEBUG] Received message on channel: {message['channel']}")
+                    #self.logger.info(f"[DEBUG] Received message on channel: {message['channel']}")
                     try:
                         payload = json.loads(message['data'])
                         #self.logger.info(f"[DEBUG] Payload received: {payload}")
@@ -136,7 +136,7 @@ class PreprocessorBot:
                 return
             # Comment out trade and orderbook processing for now
             if chans["trade"] == channel:
-                self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
+                #self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
                 self._process_trade(payload, market)
                 return
             # if chans["orderbook"] == channel:

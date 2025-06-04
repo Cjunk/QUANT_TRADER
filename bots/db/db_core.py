@@ -31,7 +31,6 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 import pytz
-import hashlib
 import logging
 import pandas as pd
 import config.config_db as db_config
@@ -46,14 +45,20 @@ from utils.HeartBeatService import HeartBeat
 from psycopg2.extras import execute_values
 from gap_utils import fix_all_data_gaps
 from kline_handler import KlineHandler
+from trade_handler import TradeHandler
+from macro_handler import MacroHandler
+from heartbeat_listener import HeartbeatListener
 if os.name == 'nt':
     sys.stdout.reconfigure(encoding='utf-8')
+
+
+# --- In PostgresDBBot ---
+
 class PostgresDBBot:
     def __init__(self, log_filename=db_config.LOG_FILENAME):
         
         self.logger = setup_logger(log_filename, getattr(logging, db_config.LOG_LEVEL.upper(), logging.WARNING))
         self.db = PostgresHandler(self.logger)
-        self.trade_buffer = []
         self.status = {
             "bot_name": db_config.BOT_NAME,
             "status": "started",
@@ -101,6 +106,10 @@ class PostgresDBBot:
         self.logger.info("Initializing PostgresDBBot...")
         self.conn = self.db.conn
         self.Klinehandler = KlineHandler(self.conn, self.logger)
+        self.trade_handler = TradeHandler(self.conn, self.logger, db_config)
+        self.macro_handler = MacroHandler(self.conn, self.logger, db_config)
+        self.heartbeat_listener = HeartbeatListener(self, config_redis, HEARTBEAT_CHANNEL, self.logger)
+        self.heartbeat_listener.start()
         if self.conn is None:
             self.logger.error("❌ Database connection failed! Exiting.")
             raise RuntimeError("Database connection failed")
@@ -109,9 +118,8 @@ class PostgresDBBot:
             fix_all_data_gaps(self)
         except Exception as e:
             self.logger.error(f"Error during gap fixing: {e}")
-        self._start_heartbeat_listener()
         self._start_archive_scheduler()
-        threading.Thread(target=self._flush_trade_buffer, daemon=True).start()
+        threading.Thread(target=self.trade_handler.flush_trade_buffer, args=(lambda: self.running,), daemon=True).start()
     def _start_archive_scheduler(self):
         def scheduler():
             while self.running:
@@ -133,7 +141,7 @@ class PostgresDBBot:
                         self.logger.error("❌ DB connection is None before DB operation!")
                     channel = message['channel']
                     data_str = message['data']
-                    self.logger.info(f"[DEBUG] Received Redis message on channel: {channel} | data: {data_str}")
+                    #self.logger.info(f"[DEBUG] Received Redis message on channel: {channel} | data: {data_str}")
                     try:
                         data_obj = json.loads(data_str)
                     except json.JSONDecodeError:
@@ -172,11 +180,11 @@ class PostgresDBBot:
             data = json.loads(raw_message['data'])
             self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
         elif channel == config_redis.MACRO_METRICS_CHANNEL:
-            self.handle_macro_metrics(data_obj)
+            self.macro_handler.handle_macro_metrics(data_obj)
         elif channel == config_redis.RAW_TRADE_CHANNEL:
-            self.handle_raw_trade(data_obj)
+            self.trade_handler.handle_raw_trade(data_obj)
         elif channel == config_redis.PRE_PROC_TRADE_CHANNEL:
-            self.handle_trade_update(data_obj)
+            self.trade_handler.handle_trade_update(data_obj)
         elif channel == config_redis.PRE_PROC_ORDER_BOOK_UPDATES:
             self.handle_orderbook_update(data_obj)
         elif channel == config_redis.COIN_CHANNEL:
@@ -191,34 +199,6 @@ class PostgresDBBot:
             self._publish_current_coin_list()
         else:
             self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
-    def handle_raw_trade(self, tdata):
-        try:
-            cursor = self.conn.cursor()
-            insert_sql = f"""
-            INSERT INTO {db_config.DB_TRADING_SCHEMA}.raw_trade_data 
-            (symbol, market, trade_time, price, volume, side, is_buyer_maker, trade_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(insert_sql, (
-                tdata["symbol"],
-                tdata["market"],
-                pd.to_datetime(tdata["trade_time"]),
-                float(tdata["price"]),
-                float(tdata["volume"]),
-                tdata.get("side"),
-                tdata.get("is_buyer_maker"),
-                tdata.get("trade_id")
-            ))
-            self.conn.commit()
-            cursor.close()
-            self.logger.debug(f"✅ Inserted trade ID {tdata.get('trade_id')} for {tdata['symbol']} at {tdata['price']}")
-        except Exception as e:
-            if self.conn:
-                self.conn.rollback()
-            self.logger.error(f"🚨 Failed to insert raw_trade_data: {e}")
-
-
-
     def save_subscription(self,market: str, symbols: list, topics: list, owner: str):
         if not owner:
             return
@@ -251,7 +231,7 @@ class PostgresDBBot:
     def stop(self):
         self.running = False
         if hasattr(self, "heartbeat"):
-            self.heartbeat.stop()
+            self.heartbeat_listener.stop()
         try:
             self.logger.info("Sending stopped status update to DB...")
             self.status_handler.handle_bot_status_update(stopped_status)
@@ -336,49 +316,7 @@ class PostgresDBBot:
         finally:
             cursor.close()
 
-    def _start_heartbeat_listener(self):
-        def listen_heartbeat():
-            heartbeat_client = redis.Redis(
-                host=config_redis.REDIS_HOST,
-                port=config_redis.REDIS_PORT,
-                db=config_redis.REDIS_DB,
-                decode_responses=True
-            )
-            pubsub = heartbeat_client.pubsub()
-            pubsub.subscribe(HEARTBEAT_CHANNEL)
-
-            while self.running:
-                message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
-                now = datetime.datetime.utcnow()
-                if message and message["type"] == "message":
-                    try:
-                        payload = json.loads(message["data"])
-                        bot_name = payload.get("bot_name")
-                        timestamp = payload.get("time")
-                        if bot_name and timestamp:
-                            if bot_name not in self.status or self.status[bot_name]['status'] == 'stopped':
-                                status_obj = {
-                                    "bot_name": bot_name,
-                                    "status": "started",
-                                    "time": timestamp,
-                                    "auth_token": payload.get("auth_token", ""),
-                                    "metadata": payload.get("metadata", {})
-                                }
-                                self.status_handler.handle_bot_status_update(status_obj)
-                            self._update_bot_last_seen(bot_name, timestamp)
-                            self.bot_status[bot_name] = {'last_seen': now, 'status': 'started'}
-                    except Exception as e:
-                        self.logger.error(f"Failed to handle heartbeat message: {e}")
-                for bot, info in list(self.bot_status.items()):
-                    last_seen = info['last_seen']
-                    if not last_seen or (now - last_seen).total_seconds() > self.heartbeat_timeout:
-                        if info['status'] != 'stopped':
-                            self.logger.warning(f"No heartbeat from {bot} for over {self.heartbeat_timeout} seconds. Marking as stopped.")
-                            self._mark_bot_stopped(bot, now)
-                            self.bot_status[bot]['status'] = 'stopped'
-                time.sleep(0.5)
-
-        threading.Thread(target=listen_heartbeat, daemon=True).start()   
+ 
 
     def _mark_bot_stopped(self, bot_name, timestamp):
         cursor = self.conn.cursor()
@@ -396,53 +334,6 @@ class PostgresDBBot:
             self.logger.error(f"❌ Failed to mark {bot_name} as stopped: {e}")
         finally:
             cursor.close()
-
-
-    def handle_trade_update(self, tdata):
-        try:
-            symbol = tdata["symbol"]
-            minute_start = pd.to_datetime(tdata["minute_start"], utc=True)
-            total_volume = float(tdata["total_volume"])
-            vwap = float(tdata["vwap"])
-            trade_count = int(tdata["trade_count"])
-            largest_trade_volume = float(tdata["largest_trade_volume"])
-            largest_trade_price = float(tdata["largest_trade_price"])
-
-            self.trade_buffer.append((
-                symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price
-            ))
-        except Exception as e:
-            self.logger.error(f"🚨 Error buffering summarized trade data: {e}")
-
-    def _flush_trade_buffer(self):
-        while self.running:
-            if self.trade_buffer:
-                try:
-                    cursor = self.conn.cursor()
-                    insert_sql = f"""
-                    INSERT INTO {db_config.DB_TRADING_SCHEMA}.trade_summary_data
-                    (symbol, minute_start, total_volume, vwap, trade_count, largest_trade_volume, largest_trade_price)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (symbol, minute_start) DO UPDATE
-                    SET
-                        total_volume = EXCLUDED.total_volume,
-                        vwap = EXCLUDED.vwap,
-                        trade_count = EXCLUDED.trade_count,
-                        largest_trade_volume = EXCLUDED.largest_trade_volume,
-                        largest_trade_price = EXCLUDED.largest_trade_price
-                    """
-                    cursor.executemany(insert_sql, self.trade_buffer)
-                    self.conn.commit()
-                    inserted = cursor.rowcount
-                    self.trade_buffer.clear()
-                except Exception as e:
-                    if self.conn:
-                        self.conn.rollback()
-                    self.logger.error(f" Error during bulk insert of trades: {e}")
-                finally:
-                    cursor.close()
-            time.sleep(5)
-
     def handle_orderbook_update(self, odata):
         try:
             symbol = odata["symbol"]
@@ -454,38 +345,6 @@ class PostgresDBBot:
                 self.store_order_book(symbol, float(p), float(v), "ask")
         except KeyError as e:
             self.logger.error(f"Missing key in orderbook update: {e}") 
-
-    def handle_macro_metrics(self, data):
-        try:
-            cursor = self.conn.cursor()
-            insert_sql = f"""
-            INSERT INTO {db_config.DB_TRADING_SCHEMA}.macro_metrics (
-                timestamp, btc_dominance, eth_dominance, total_market_cap, total_volume,
-                active_cryptos, markets, fear_greed_index, market_sentiment, btc_open_interest, us_inflation
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (timestamp) DO NOTHING;
-            """
-            cursor.execute(insert_sql, (
-                data['timestamp'],
-                data.get('btc_dominance'),
-                data.get('eth_dominance'),
-                data.get('total_market_cap'),
-                data.get('total_volume'),
-                data.get('active_cryptos'),
-                data.get('markets'),
-                data.get('fear_greed_index'),
-                data.get('market_sentiment'),
-                data.get('btc_open_interest'),
-                data.get('us_inflation')
-            ))
-            self.conn.commit()
-            cursor.close()
-            self.logger.info(f"✅ Inserted macro metric @ {data['timestamp']}")
-        except Exception as e:
-            if self.conn:
-                self.conn.rollback()
-            self.logger.error(f"❌ Error inserting macro metric: {e}")
-
     def _load_initial_bot_status(self):
         status = {}
         cursor = self.db.conn.cursor()

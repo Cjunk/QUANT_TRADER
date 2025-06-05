@@ -21,6 +21,7 @@ class RedisHandler:
                     retry_on_timeout=True
                 )
                 self.client.ping()
+                self.pubsub = self.client.pubsub()
                 self.logger.info("Connected to Redis.")
                 break
             except redis.ConnectionError:

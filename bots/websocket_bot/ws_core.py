@@ -21,15 +21,15 @@ Redis Channels Used:
 # =====================================================
 # Jericho: Imports and Config
 # =====================================================
-import json, threading, queue, time, signal, datetime, logging, os
+import json, threading, queue, datetime,time, logging, os
 import websocket
 
 import config_websocket_bot as cfg
-from utils import setup_logger, get_redis
+from utils import setup_logger
 from utils.redis_handler import RedisHandler
 from utils.HeartBeatService import HeartBeat
 from config import config_redis as r_cfg
-from config import config_common as common_cfg
+#from config import config_common as common_cfg
 from subscription_handler import SubscriptionHandler, MAX_SYMBOLS
 from message_router import MessageRouter
 from websocket_utils import send_webhook
@@ -43,6 +43,7 @@ PING_SEC, PONG_TIMEOUT, REOPEN_SEC = 20, 10, 2
 # =====================================================
 # Jericho: WebSocketBot Class
 # =====================================================
+CAPTURE_ORDER_DELTAS = True
 class WebSocketBot(threading.Thread):
     """
     Jericho: Professional, minimal, and robust WebSocket trading bot core.
@@ -409,6 +410,41 @@ class WebSocketBot(threading.Thread):
                 self.kline_count += 1
             elif "orderbook" in topic:
                 _, depth, symbol = topic.split(".")
+                if CAPTURE_ORDER_DELTAS:
+                    #self.logger.info(f"[ORDERBOOK DELTA] {self.market.upper()} | {symbol} | depth={depth}")
+
+                    payload = data.get("data", {})
+
+                for side_key, side_label in [("b", "bid"), ("a", "ask")]:
+                    if side_key in payload:
+                        for entry in payload[side_key]:
+                            try:
+                                price, volume = entry
+                                update_type = "delete" if float(volume) == 0 else "update"
+                                message = {
+                                    "symbol": symbol,
+                                    "market": self.market,
+                                    "depth": int(depth),
+                                    "side": side_label,
+                                    "price": price,
+                                    "volume": volume,
+                                    "update_type": update_type,
+                                    "received_at": datetime.datetime.utcnow().isoformat()
+
+                                }
+                                self.redis_handler.publish(
+                                    r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_delta"],
+                                    json.dumps(message)
+                                )
+                            except Exception as e:
+                                self.logger.error(f"Redis publish failed for entry: {entry} | Error: {e}")
+
+
+
+                    #self.redis_handler.publish(
+                        #r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_delta"],
+                        #json.dumps({"symbol": symbol, "depth": depth, "data": data})
+                    #)
                 #self.logger.info(f"[DEBUG] ORDERBOOK DATA RECEIVED: symbol={symbol} depth={depth} data={data}")
             elif "publicTrade" in topic:
                 _, symbol = topic.split(".")

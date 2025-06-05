@@ -139,10 +139,10 @@ class PreprocessorBot:
                 #self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
                 self._process_trade(payload, market)
                 return
-            # if chans["orderbook"] == channel:
-            #     self.logger.info(f"[DEBUG] Detected orderbook channel for market: {market}")
-            #     self._process_orderbook(payload, market)
-            #     return
+            if chans["orderbook"] == channel:
+                self.logger.info(f"[DEBUG] Detected orderbook channel for market: {market}")
+                self._process_orderbook(payload, market)
+                return
 
     # =========================
     # Trade Window Management

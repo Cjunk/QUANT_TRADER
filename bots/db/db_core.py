@@ -87,6 +87,7 @@ class PostgresDBBot:
             config_redis.REQUEST_COINS,
             config_redis.RAW_TRADE_CHANNEL,
             config_redis.DB_SAVE_SUBSCRIPTIONS,
+            config_redis.REDIS_CHANNEL["spot.orderbook_delta"],
             config_redis.DB_REQUEST_SUBSCRIPTIONS])
         self.logger.info("Redis connected and subscribed to channels.")
         self.redis_client = self.redis_handler.client
@@ -179,6 +180,8 @@ class PostgresDBBot:
         elif channel == config_redis.DB_SAVE_SUBSCRIPTIONS:
             data = json.loads(raw_message['data'])
             self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
+        elif channel in [config_redis.REDIS_CHANNEL["spot.orderbook_delta"], config_redis.REDIS_CHANNEL["linear.orderbook_delta"]]:
+            self.handle_orderbook_delta(data_obj)
         elif channel == config_redis.MACRO_METRICS_CHANNEL:
             self.macro_handler.handle_macro_metrics(data_obj)
         elif channel == config_redis.RAW_TRADE_CHANNEL:
@@ -199,6 +202,31 @@ class PostgresDBBot:
             self._publish_current_coin_list()
         else:
             self.logger.warning(f"Unrecognized channel: {channel}, data={data_obj}")
+    def handle_orderbook_delta(self, data):
+        try:
+            sql = f"""
+                INSERT INTO {db_config.DB_TRADING_SCHEMA}.orderbook_deltas
+                (symbol, market, depth, side, price, volume, update_type, received_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            values = (
+                data["symbol"],
+                data["market"],
+                int(data["depth"]),
+                data["side"],
+                float(data["price"]),
+                float(data["volume"]),
+                data["update_type"],
+                data["received_at"]
+            )
+            with self.conn.cursor() as cur:
+                cur.execute(sql, values)
+            self.conn.commit()
+        except Exception as e:
+            self.logger.error(f"Error inserting orderbook delta: {e}")
+            if self.conn:
+                self.conn.rollback()
+
     def save_subscription(self,market: str, symbols: list, topics: list, owner: str):
         if not owner:
             return

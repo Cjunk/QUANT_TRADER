@@ -1,15 +1,18 @@
 # Ignore config files and environment variables
-config*
+config*.py
+*/config*.py
+*/*/config*.py
+.env
 *.env
 fun_trade_bot.py
 *.logs
 *.log
-logs*
+logs/
 venv/
-Shortcuts
+Shortcuts/
 SQL/
 mybot.code-workspace*
-.vscode
-QuantTradingBots*
-BIN
-.gitignore
+.vscode/
+QuantTradingBots/
+BIN/
+testaccount.py

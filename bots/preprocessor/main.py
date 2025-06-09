@@ -5,6 +5,7 @@ from preprocessor_core import PreprocessorBot
 if __name__ == "__main__":
 
     #open('logs/DB_BOT.log', 'w').close()
+    print("About to create PreprocessorBot")
     bot = PreprocessorBot()
     try:
         bot.run()

@@ -1,5 +1,6 @@
 import os
 import re
+import pathspec
 
 # Patterns to look for (add more as needed)
 SENSITIVE_PATTERNS = [
@@ -29,35 +30,15 @@ SCAN_EXTENSIONS = ('.py', '.php', '.env', '.json', '.yml', '.yaml', '.ini', '.cf
 
 # Read .gitignore to skip ignored files/folders
 def load_gitignore():
-    ignored = set()
     if os.path.exists('.gitignore'):
         with open('.gitignore', 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    ignored.add(line.rstrip('/'))
-    return ignored
+            return pathspec.PathSpec.from_lines('gitwildmatch', f)
+    return None
 
-def is_ignored(path, ignored):
-    basename = os.path.basename(path)
-    # Ignore this script itself
-    if basename == os.path.basename(__file__):
-        return True
-    for ignore in ignored:
-        # Ignore exact matches (e.g., .env, sensisitve_data_leak.py)
-        if basename == ignore or path == ignore:
-            return True
-        # Ignore patterns like config*.py anywhere in the tree
-        if ignore.endswith('*'):
-            if basename.startswith(ignore.rstrip('*')):
-                return True
-            # Also check for patterns like */config*.py
-            if ignore.startswith('*/') and basename.startswith(ignore.lstrip('*/').rstrip('*')):
-                return True
-        # Ignore directories (ending with /)
-        if ignore.endswith('/') and (path.startswith(ignore.rstrip('/')) or basename == ignore.rstrip('/')):
-            return True
-    return False
+def is_ignored(path, spec):
+    if spec is None:
+        return False
+    return spec.match_file(path)
 
 def scan_file(filepath):
     results = []
@@ -72,16 +53,20 @@ def scan_file(filepath):
     return results
 
 def main():
-    ignored = load_gitignore()
+    spec = load_gitignore()
+    script_name = os.path.basename(__file__)
     print("Scanning for sensitive information...\n")
     for root, dirs, files in os.walk('.'):
-        # Skip ignored directories
-        dirs[:] = [d for d in dirs if not is_ignored(os.path.relpath(os.path.join(root, d), '.'), ignored)]
+        # Remove ignored directories in-place
+        dirs[:] = [d for d in dirs if not is_ignored(os.path.relpath(os.path.join(root, d), '.'), spec)]
         for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), '.')
+            # Ignore this script itself
+            if file == script_name:
+                continue
+            if is_ignored(rel_path, spec):
+                continue
             if file.endswith(SCAN_EXTENSIONS):
-                rel_path = os.path.relpath(os.path.join(root, file), '.')
-                if is_ignored(rel_path, ignored):
-                    continue
                 matches = scan_file(os.path.join(root, file))
                 if matches:
                     print(f"\n[!] Potential sensitive info in {rel_path}:")

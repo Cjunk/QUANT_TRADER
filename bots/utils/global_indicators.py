@@ -31,7 +31,7 @@ from utils.logger import setup_logger
 
 class GlobalIndicators:
     # ==== Configurable Constants (no hardcoded values) ====
-    RSI_PERIOD = 6
+    RSI_PERIOD = 20
     EMA12_SPAN = 12
     EMA26_SPAN = 26
     MACD_SIGNAL_SPAN = 9

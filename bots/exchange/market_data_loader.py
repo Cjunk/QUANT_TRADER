@@ -1,5 +1,9 @@
 from datetime import datetime, timedelta
 from pytz import UTC
+import logging
+
+# === Master Debug Switch ===
+DEBUG = True  # Set to False to disable debug logging
 
 # Control constants
 DEFAULT_WINDOW_MINUTES = 5  # Default time window for event loading (in minutes)
@@ -28,7 +32,12 @@ class MarketDataLoader:
             logger: Configured logger for runtime logging.
         """
         self.db = db
+        # Set logger level based on DEBUG switch
         self.logger = logger
+        if DEBUG:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
 
     def report_data_ranges(self):
         """
@@ -49,7 +58,7 @@ class MarketDataLoader:
             # Fetch the available timestamp range for order book deltas
             book_range_sql = """
                 SELECT MIN(received_at) AS start, MAX(received_at) AS end
-                FROM trading.orderbook_deltas;
+                FROM trading.synced_orderbook_deltas;
             """
             cursor.execute(book_range_sql)
             book_start, book_end = cursor.fetchone()

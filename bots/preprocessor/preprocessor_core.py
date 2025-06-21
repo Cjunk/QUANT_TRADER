@@ -17,11 +17,11 @@ import config.config_redis as config_redis
 import config.config_auto_preprocessor_bot as config_auto
 from utils.redis_handler import RedisHandler
 from utils.HeartBeatService import HeartBeat
-import psutil  # Add this import for memory usage
+import psutil
 
 
-# === Debug Switch ===
-DEBUG_MODE = True  # Set to False to disable debug logging
+# === Master Debug Switch ===
+DEBUG = False  # Set to False to disable debug logging
 
 class PreprocessorBot:
     """
@@ -35,7 +35,7 @@ class PreprocessorBot:
         """
         Initialize the PreprocessorBot, set up logging, Redis, heartbeat, and data structures.
         """
-        log_level = logging.DEBUG if DEBUG_MODE else getattr(logging, config_auto.LOG_LEVEL.upper(), logging.WARNING)
+        log_level = logging.DEBUG if DEBUG else getattr(logging, config_auto.LOG_LEVEL.upper(), logging.INFO)
         self.logger = setup_logger(
             config_auto.LOG_FILENAME,
             log_level
@@ -111,7 +111,7 @@ class PreprocessorBot:
         self.logger.info(f"Version: {getattr(config_auto, 'VERSION', 'N/A')}")
         self.logger.info(f"Strategy: {getattr(config_auto, 'STRATEGY_NAME', 'N/A')}")
         self.logger.info(f"Window Size: {getattr(config_auto, 'WINDOW_SIZE', 'N/A')}")
-        self.logger.info(f"Log Level: {'DEBUG' if DEBUG_MODE else config_auto.LOG_LEVEL.upper()}")
+        self.logger.info(f"Log Level: {'DEBUG' if DEBUG else config_auto.LOG_LEVEL.upper()}")
         self.logger.info(f"Process ID: {os.getpid()}")
         self.logger.info(f"Platform: {platform.platform()}")
         self.logger.info(f"Python: {platform.python_version()}")
@@ -141,35 +141,36 @@ class PreprocessorBot:
         while self.running:
             try:
                 message = self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                self.logger.debug(f"[DEBUG] Received Redis message: {message}")
                 if message and message['type'] == 'message':
-                    #self.logger.info(f"[DEBUG] Received message on channel: {message['channel']}")
+                    self.logger.debug(f"[DEBUG] Received message on channel: {message['channel']}")
                     try:
                         payload = json.loads(message['data'])
-                        #self.logger.info(f"[DEBUG] Payload received: {payload}")
+                        self.logger.debug(f"[DEBUG] Payload received: {payload}")
                     except Exception as e:
-                        self.logger.error(f"[DEBUG] Failed to decode JSON payload: {e} RAW: {message['data']}")
+                        self.logger.info(f"[DEBUG] Failed to decode JSON payload: {e} RAW: {message['data']}")
                         continue
                     self._route_message(message['channel'], payload)
             except Exception as e:
-                self.logger.error(f"❌ Failed to handle Redis message: {e}")
+                self.logger.info(f"❌ Failed to handle Redis message: {e}")
 
     def _route_message(self, channel, payload):
         """
         Route incoming Redis messages to the appropriate handler based on channel.
         """
-        #self.logger.info(f"[DEBUG] Routing message from channel: {channel} payload: {payload}")
+
+        self.logger.debug(f"[DEBUG] Routing message from channel: {channel} payload: {payload}")
         for market, chans in self.market_channels.items():
             if chans["kline"] == channel:
-                #self.logger.info(f"[DEBUG] Detected kline channel for market: {market}")
+                self.logger.debug(f"[DEBUG] Detected kline channel for market: {market}")
                 self._process_kline(payload, market)
                 return
-            # Comment out trade and orderbook processing for now
             if chans["trade"] == channel:
-                #self.logger.info(f"[DEBUG] Detected trade channel for market: {market}")
+                self.logger.debug(f"[DEBUG] Detected trade channel for market: {market}")
                 self._process_trade(payload, market)
                 return
             if chans["orderbook"] == channel:
-                #self.logger.info(f"[DEBUG] Detected orderbook channel for market: {market}")
+                self.logger.debug(f"[DEBUG] Detected orderbook channel for market: {market}")
                 self._process_orderbook(payload, market)
                 return
 
@@ -187,7 +188,7 @@ class PreprocessorBot:
                 for key in expired:
                     self._publish_trade_summary(key, self.trade_windows.pop(key))
             except Exception as e:
-                self.logger.error(f"❌ Error flushing old trades: {e}")
+                self.logger.info(f"❌ Error flushing old trades: {e}")
             time.sleep(1)
 
     def _publish_trade_summary(self, key, trades):
@@ -244,7 +245,7 @@ class PreprocessorBot:
         Process a kline message, enrich it, and publish the result.
         Also updates the klines_processed counter for the market.
         """
-        self.logger.info(f"[DEBUG] Processing kline for {market}: {payload}")
+        self.logger.debug(f"[DEBUG] Processing kline for {market}: {payload}")
         symbol, interval = payload['symbol'], payload['interval']
         redis_key = f"kline_window:{market}:{symbol}:{interval}"
 
@@ -256,7 +257,7 @@ class PreprocessorBot:
         if window:
             last = window[-1]
             if last['start_time'] == payload['start_time'] and last['close'] == payload['close'] and payload['market'] == last['market'] and payload['interval'] == last['interval']:
-                self.logger.info(f"[DEBUG] Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
+                self.logger.debug(f"[DEBUG] Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
                 return
 
         payload['market'] = market
@@ -280,7 +281,7 @@ class PreprocessorBot:
             out_channel = config_redis.PRE_PROC_KLINE_UPDATES
             self.redis_handler.publish(out_channel, json.dumps(enriched_kline))
         except Exception as e:
-            self.logger.error(f"❌ Error processing kline for {market}: {e}")
+            self.logger.info(f"❌ Error processing kline for {market}: {e}")
 
     def _process_trade(self, payload, market=None):
         """
@@ -298,9 +299,9 @@ class PreprocessorBot:
             # 🔥 Emit full trade delta to DB via Redis
             payload["market"] = market
             self.redis_handler.publish(config_redis.RAW_TRADE_CHANNEL, json.dumps(payload))
-            #self.logger.debug(f"📤 Published raw trade for {symbol} at {payload['price']}")
+            self.logger.debug(f"📤 Published raw trade for {symbol} at {payload['price']}")
         except Exception as e:
-            self.logger.error(f"❌ Error processing trade: {e}")
+            self.logger.info(f"❌ Error processing trade: {e}")
 
     def _process_orderbook(self, payload, market=None):
         """
@@ -309,8 +310,9 @@ class PreprocessorBot:
         try:
             out_channel = config_redis.PRE_PROC_ORDER_BOOK_UPDATES
             self.redis_handler.publish(out_channel, json.dumps(payload))
+            self.logger.debug(f"📤 Published orderbook update for {payload.get('symbol', 'unknown')}")
         except Exception as e:
-            self.logger.error(f"❌ Error processing orderbook for {market}: {e}")
+            self.logger.info(f"❌ Error processing orderbook for {market}: {e}")
 
     # =========================
     # Public Interface
@@ -335,7 +337,7 @@ class PreprocessorBot:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            self.logger.warning("🛑 Keyboard Interrupt received.")
+            self.logger.info("🛑 Keyboard Interrupt received.")
             self.stop()
 
 

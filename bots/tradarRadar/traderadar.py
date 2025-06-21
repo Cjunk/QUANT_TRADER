@@ -66,7 +66,7 @@ class TradeRadar:
         now = timestamp or datetime.utcnow()
         if key not in self.windows:
             
-            self.logger.info(f"[TradeRadar] 🆕 Creating new TradeWindow for {key}")
+            self.logger.info(f"[TradeRadar] 🆕 NEW TRADE DATA DETECTED: Creating new TradeWindow for {key}")
             self.windows[key] = TradeWindow(self.max_duration)
         self.windows[key].add_trade(price, volume, side, now)
         self.last_trade_time[key] = now
@@ -99,14 +99,7 @@ class TradeRadar:
     def get_stats(self, symbol, market, include_trend_bias=False):
         """
         Compute VWAP, CVD, and volume stats over configured intervals for a given market-symbol pair.
-
-        Args:
-            symbol (str)
-            market (str)
-            include_trend_bias (bool): Whether to include start-end VWAP/CVD analysis.
-
-        Returns:
-            dict: Nested dictionary keyed by interval (e.g., "60s") with metric values.
+        Only returns stats for intervals where the time span from first trade to now >= interval.
         """
         key = (symbol, market)
         if key not in self.windows:
@@ -115,9 +108,25 @@ class TradeRadar:
         result = {}
         window = self.windows[key]
 
+        # Find the timestamp of the first trade in the window
+        if not window.trades:
+            return {}
+
+        first_trade_time = window.trades[0]['timestamp'] if isinstance(window.trades[0], dict) else window.trades[0][0]
+        now = datetime.utcnow()
         for interval in self.intervals_secs:
+            interval_td = timedelta(seconds=interval)
+            # Only compute stats if enough time has passed since the first trade
+            if now - first_trade_time < interval_td:
+                result[f"{interval}s"] = {
+                    "has_enough_data": False,
+                    "message": f"Not enough time elapsed for {interval}s interval (need {interval}s, have {(now - first_trade_time).total_seconds():.1f}s)"
+                }
+                continue
+
             stats = window.compute_stats(interval)
             result[f"{interval}s"] = stats
+            result[f"{interval}s"]["has_enough_data"] = True
 
             if include_trend_bias:
                 vwap_start, vwap_end, cvd_start, cvd_end = window.get_trend_inputs(interval)
@@ -152,7 +161,7 @@ class TradeRadar:
             if key in stats_dict:
                 stats_dict[key] = round(stats_dict[key], 4)
 
-    def publish_stats(self, symbol, market, include_trend_bias=False, channel_prefix="market_facts"):
+    def publish_stats(self, symbol, price,market, include_trend_bias=False):
         stats = self.get_stats(symbol, market, include_trend_bias=include_trend_bias)
         if not stats:
             if DEBUG:
@@ -167,12 +176,13 @@ class TradeRadar:
 
         message = {
             "symbol": symbol,
+            "price": price,
             "market": market,
             "timestamp": datetime.utcnow().isoformat(),
             "stats": stats
         }
 
-        channel = f"{channel_prefix}:{market}:{symbol}"
+        channel = f"{config_redis.TRADE_SIGNAL_PREFIX}:{market}:{symbol}"
         json_message = json.dumps(message)
 
         if self.redis:

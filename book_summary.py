@@ -1,6 +1,6 @@
 import time
 import os
-from utils.redis_client import get_order_book, get_latest_trade
+from bots.utils.redis_client import get_order_book, get_latest_trade
 
 def bucket_orders(orders, bucket_size=10):
     """

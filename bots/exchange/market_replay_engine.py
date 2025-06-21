@@ -30,6 +30,22 @@ class MarketReplayEngine:
             self.logger.warning("⚠️ No events to replay.")
             return
 
+        # --- Startup Info ---
+        channel_keys = [
+            f"{market}.{etype}_out"
+            for market in ["spot", "linear", "derivatives"]
+            for etype in ["kline", "trade", "orderbook"]
+        ]
+        channels = [
+            self.config.REDIS_CHANNEL.get(key)
+            for key in channel_keys
+            if self.config.REDIS_CHANNEL.get(key) is not None
+        ]
+        self.logger.info("========== MarketReplayEngine Startup ==========")
+        self.logger.info("This is the MarketReplayEngine.")
+        self.logger.info(f"Will publish to Redis channels: {channels}")
+        self.logger.info("===============================================")
+
         self.logger.info(f"🚀 Starting market replay at {self.speed}x speed...")
 
         prev_ts = isoparse(self.events[0].get("trade_time") or self.events[0].get("timestamp"))

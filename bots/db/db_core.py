@@ -89,6 +89,9 @@ class PostgresDBBot:
             config_redis.DB_SAVE_SUBSCRIPTIONS,
             config_redis.REDIS_CHANNEL["spot.orderbook_delta"],
             config_redis.DB_REQUEST_SUBSCRIPTIONS])
+        # Subscribe to all channels starting with TRADE_SIGNAL_PREFIX
+        self.pubsub = self.redis_handler.client.pubsub()
+        self.pubsub.psubscribe(f"{config_redis.TRADE_SIGNAL_PREFIX}:*")
         self.logger.info("Redis connected and subscribed to channels.")
         self.redis_client = self.redis_handler.client
         self.pubsub = self.redis_handler.pubsub
@@ -138,10 +141,24 @@ class PostgresDBBot:
             try:
                 message = self.redis_handler.get_message(timeout=1)
                 if message:
-                    if self.conn is None:
-                        self.logger.error("❌ DB connection is None before DB operation!")
                     channel = message['channel']
                     data_str = message['data']
+                    # Handle radar trade signals
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
+                    if channel.startswith(config_redis.TRADE_SIGNAL_PREFIX):
+                        try:
+                            data = json.loads(data_str)
+                            # Extract market and symbol from channel name, e.g. "TRADE_SIGNAL_PREFIX:spot:BTCUSDT"
+                            parts = channel.split(":")
+                            market = parts[1] if len(parts) > 2 else None
+                            symbol = parts[2] if len(parts) > 2 else None
+                            price = data.get("price")
+                            timestamp = data.get("timestamp")
+                            self.save_radar_trade_signal(market, symbol, price, timestamp, data)
+                        except Exception as e:
+                            self.logger.error(f"Error processing radar trade signal: {e}")
+                        continue
                     #self.logger.info(f"[DEBUG] Received Redis message on channel: {channel} | data: {data_str}")
                     try:
                         data_obj = json.loads(data_str)
@@ -179,7 +196,12 @@ class PostgresDBBot:
                 self.publish_websocket_subscriptions(market)
         elif channel == config_redis.DB_SAVE_SUBSCRIPTIONS:
             data = json.loads(raw_message['data'])
+            # Ignore if owner is just the market name
+            if data['owner'] in ('spot', 'linear', 'derivatives'):
+                self.logger.info(f"Ignoring subscription save with owner={data['owner']}")
+                return
             self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
+            self.logger.info(f"Saved subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
         elif channel in [config_redis.REDIS_CHANNEL["spot.orderbook_delta"], config_redis.REDIS_CHANNEL["linear.orderbook_delta"]]:
             self.handle_orderbook_delta(data_obj)
         elif channel == config_redis.MACRO_METRICS_CHANNEL:
@@ -239,15 +261,16 @@ class PostgresDBBot:
         query = """
         INSERT INTO trading.websocket_subscriptions (market, symbol, topic, owner)
         VALUES %s
-        ON CONFLICT (market, symbol, topic, owner) DO NOTHING
+        ON CONFLICT (market, symbol, topic, owner) DO UPDATE SET owner = EXCLUDED.owner
         """
         execute_values(cur, query, rows)
         self.conn.commit()
         cur.close()
 
     def run(self):
-        self.logger.info("DB Bot running, starting Redis listener thread...")
+        self.logger.info("DB Bot running, starting Redis listener threads...")
         threading.Thread(target=self._listen_to_redis, daemon=True).start()
+        threading.Thread(target=self.listen_radar_trade_signals, daemon=True).start()
         while self.running:
             time.sleep(1)
   
@@ -262,6 +285,13 @@ class PostgresDBBot:
             self.heartbeat_listener.stop()
         try:
             self.logger.info("Sending stopped status update to DB...")
+            stopped_status = {
+                "bot_name": self.status["bot_name"],
+                "status": "stopped",
+                "time": datetime.datetime.utcnow().isoformat(),
+                "auth_token": self.status.get("auth_token"),
+                "metadata": self.status.get("metadata", {})
+            }
             self.status_handler.handle_bot_status_update(stopped_status)
         except Exception as e:
             self.logger.error(f"Failed to update stopped status in DB: {e}")
@@ -449,4 +479,77 @@ class PostgresDBBot:
             self.logger.error(f"Error publishing websocket subscriptions: {e}")
         finally:
             cur.close()
+
+    def set_websocket_subscriptions(self, market: str, symbols: list, topics: list, owner: str):
+        """
+        Replace all websocket subscriptions for a given owner/market with the provided symbols/topics.
+        """
+        if not owner or not market:
+            self.logger.error("Owner and market are required for setting websocket subscriptions.")
+            return
+
+        cur = self.conn.cursor()
+        try:
+            # Delete existing subscriptions for this owner/market
+            cur.execute(
+                f"DELETE FROM {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions WHERE owner = %s AND market = %s",
+                (owner, market)
+            )
+            # Insert new subscriptions
+            rows = []
+            for symbol in symbols:
+                for topic in topics:
+                    rows.append((market, symbol, topic, owner))
+            if rows:
+                query = f"""
+                INSERT INTO {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions (market, symbol, topic, owner)
+                VALUES %s
+                ON CONFLICT (market, symbol, topic, owner) DO NOTHING
+                """
+                execute_values(cur, query, rows)
+            self.conn.commit()
+            self.logger.info(f"Set websocket subscriptions for owner={owner}, market={market}: {len(rows)} rows.")
+        except Exception as e:
+            self.logger.error(f"Error setting websocket subscriptions: {e}")
+            self.conn.rollback()
+        finally:
+            cur.close()
+
+    def save_radar_trade_signal(self, market, symbol, price, timestamp, raw):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {db_config.DB_TRADING_SCHEMA}.radar_trade_signals
+                    (market, symbol, price, timestamp, raw)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (market, symbol, price, timestamp, json.dumps(raw))
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.logger.error(f"Error saving radar trade signal: {e}")
+            if self.conn:
+                self.conn.rollback()
+
+    def listen_radar_trade_signals(self):
+        self.pubsub = self.redis_handler.client.pubsub()
+        self.pubsub.psubscribe(f"{config_redis.TRADE_SIGNAL_PREFIX}:*")
+        self.logger.info(f"Subscribed to Redis pattern: {config_redis.TRADE_SIGNAL_PREFIX}:*")
+        for message in self.pubsub.listen():
+            if message["type"] != "pmessage":
+                continue
+            channel = message["channel"].decode() if isinstance(message["channel"], bytes) else message["channel"]
+            if not channel.startswith(config_redis.TRADE_SIGNAL_PREFIX):
+                continue
+            try:
+                data = json.loads(message["data"])
+                parts = channel.split(":")
+                market = parts[1] if len(parts) > 2 else None
+                symbol = parts[2] if len(parts) > 2 else None
+                price = data.get("price")
+                timestamp = data.get("timestamp")
+                self.save_radar_trade_signal(market, symbol, price, timestamp, data)
+            except Exception as e:
+                self.logger.error(f"Error processing radar trade signal: {e}")
 

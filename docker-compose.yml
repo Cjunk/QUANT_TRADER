@@ -116,6 +116,22 @@ services:
       - ./bots/trigger:/app
       - ./bots/utils:/app/utils
       - ./bots/config:/app/config
+  tradar_radar:
+    build:
+      context: .
+      dockerfile: bots/tradarRadar/Dockerfile
+    depends_on:
+      - redis
+    environment:
+      BOT_AUTH_TOKEN: ${TRADAR_RADAR_AUTH_TOKEN}
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_DB: ${REDIS_DB}
+    volumes:
+      - ./bots/tradarRadar:/app
+      - ./bots/utils:/app/utils
+      - ./bots/config:/app/config
+
 
 volumes:
   postgres-data:

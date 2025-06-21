@@ -5,6 +5,8 @@ Launches TradeRadar as a standalone service.
 Feeds it live trade data from Redis pub/sub and publishes stats to Redis.
 """
 
+
+# TODO: Stop it from logging TWICE in docker-compose logs
 # ========== CONFIGURATION ========== 
 DEBUG = False  # Set to False to disable debug logging
 
@@ -15,23 +17,24 @@ load_dotenv(override=True)
 import sys, os, time, json
 from datetime import datetime
 import threading
+import os
+print(f"🧬 PID: {os.getpid()}")
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
 from traderadar import TradeRadar
+from config import config_redis
 from utils.redis_handler import RedisHandler
 from utils.logger import setup_logger
 from utils.HeartBeatService import HeartBeat
-import config.config_redis as config_redis
+
 
 # Configuration
 TRADE_WINDOW_DURATION = 900
 IDLE_TIMEOUT = 300
 INTERVALS = [60, 300, 600]
-PUBLISH_INTERVAL = 2  # seconds
-TARGET_SYMBOL = "BTCUSDT"
-TARGET_MARKET = "spot"
+PUBLISH_INTERVAL = 5  # seconds
 
 # Setup Radar
 logger = setup_logger("TradeRadarService.log")
@@ -40,7 +43,7 @@ if DEBUG:
 else:
     logger.setLevel("INFO")
 
-redis = RedisHandler(config_redis, logger, service_name="TradeRadar", debug=DEBUG)
+redis = RedisHandler(config_redis, logger)
 redis.connect()
 if DEBUG:
     logger.debug("DEBUG mode is ON")
@@ -56,7 +59,7 @@ radar = TradeRadar(
 # Setup HeartBeat
 heartbeat = HeartBeat(
     bot_name="TradeRadar",
-    auth_token="your_auth_token",  # If required, else remove
+    auth_token="a16db698d09ef236d1f9c41f69c6d460b79a8c7de962fff787ef4e6dca38b36a",  # If required, else remove
     logger=logger,
     redis_handler=redis,
     metadata={"service": "TradeRadar"},
@@ -95,15 +98,14 @@ if __name__ == "__main__":
                     if DEBUG:
                         logger.debug(f"[radar_runner] Received trade: {symbol} {market} {side} {volume}@{price} at {timestamp}")
 
-                    radar.add_trade(symbol, market, price, volume, side, timestamp)
+                    radar.add_trade(symbol, market, price,volume, side, timestamp)
 
-                    if symbol == TARGET_SYMBOL and market == TARGET_MARKET:
-                        now = time.time()
-                        if now - last_publish_time >= PUBLISH_INTERVAL:
-                            if DEBUG:
-                                logger.debug(f"[radar_runner] Publishing stats for {symbol}-{market}")
-                            radar.publish_stats(symbol, market, include_trend_bias=True)
-                            last_publish_time = now
+                    now = time.time()
+                    if now - last_publish_time >= PUBLISH_INTERVAL:
+                        if DEBUG:
+                            logger.debug(f"[radar_runner] Publishing stats for {symbol}-{market}")
+                        radar.publish_stats(symbol, price, market, include_trend_bias=True)
+                        last_publish_time = now
 
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to process trade message: {e}")

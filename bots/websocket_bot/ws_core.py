@@ -228,6 +228,7 @@ class WebSocketBot(threading.Thread):
             self.subscriptions -= new_subs
         self.logger.debug(f"Updated subscriptions: {self.subscriptions}")
         self._update_subscriptions()
+        self._sync_subscriptions_to_db()  # <-- Add this line
 
     def _build_subscriptions(self, symbols, channels):
         """
@@ -510,6 +511,20 @@ class WebSocketBot(threading.Thread):
                 return
             time.sleep(0.5)
         self.logger.warning(f"⚠️ No subscriptions found in Redis for {self.market} after {timeout} seconds.")
+
+    def _sync_subscriptions_to_db(self):
+        """
+        Publishes the current subscriptions to the database bot via Redis.
+        """
+        payload = {
+            "action": "set_websocket_subscriptions",
+            "owner": self.market,
+            "market": self.market,
+            "symbols": sorted({sub.split(".")[-1] for sub in self.subscriptions}),
+            "topics": sorted({sub.split(".")[0] for sub in self.subscriptions}),
+        }
+        self.logger.info(f"Syncing subscriptions to DB bot: {payload}")
+        self.redis.publish(r_cfg.DB_SAVE_SUBSCRIPTIONS, json.dumps(payload))
 
 
 

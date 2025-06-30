@@ -249,23 +249,28 @@ class PostgresDBBot:
             if self.conn:
                 self.conn.rollback()
 
-    def save_subscription(self,market: str, symbols: list, topics: list, owner: str):
+    def save_subscription(self, market: str, symbols: list, topics: list, owner: str):
         if not owner:
             return
         cur = self.conn.cursor()
-        rows = []
-        for symbol in symbols:
-            for topic in topics:
-                rows.append((market, symbol, topic, owner))
-
-        query = """
-        INSERT INTO trading.websocket_subscriptions (market, symbol, topic, owner)
-        VALUES %s
-        ON CONFLICT (market, symbol, topic, owner) DO UPDATE SET owner = EXCLUDED.owner
-        """
-        execute_values(cur, query, rows)
-        self.conn.commit()
-        cur.close()
+        try:
+            for symbol in symbols:
+                for topic in topics:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions (market, symbol, topic, owner)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (market, symbol, topic) DO UPDATE SET owner = EXCLUDED.owner
+                        """,
+                        (market, symbol, topic, owner)
+                    )
+            self.conn.commit()
+            self.logger.info(f"Saved/updated subscription(s) for owner={owner}")
+        except Exception as e:
+            self.logger.error(f"Error saving subscription: {e}")
+            self.conn.rollback()
+        finally:
+            cur.close()
 
     def run(self):
         self.logger.info("DB Bot running, starting Redis listener threads...")
@@ -463,16 +468,17 @@ class PostgresDBBot:
                 if not owner and row_owner:
                     owner = row_owner
             if symbols and topics:
-                payload = json.dumps({
-                    "action": "set",
-                    "owner": owner or "db_bot",
-                    "market": market,
-                    "symbols": sorted(list(symbols)),
-                    "topics": sorted(list(topics))
-                })
-                # Push to the correct Redis list
-                redis_list = f"{market}_coin_subscriptions"
-                self.redis_handler.client.lpush(redis_list, payload)
+                # Build the Redis set key that WebSocket bot expects
+                redis_key = f"most_recent_subscriptions:{market}"
+                
+                # Clear the existing set and add new subscriptions
+                self.redis_handler.client.delete(redis_key)
+                for symbol in symbols:
+                    for topic in topics:
+                        subscription = f"{topic}.{symbol}"
+                        self.redis_handler.client.sadd(redis_key, subscription)
+                
+                self.logger.info(f"Published {len(symbols) * len(topics)} subscriptions to Redis set: {redis_key}")
             else:
                 self.logger.info(f"No websocket subscriptions found for market '{market}'. Redis list not updated.")
         except Exception as e:

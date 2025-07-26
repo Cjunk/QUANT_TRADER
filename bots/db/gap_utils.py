@@ -1,14 +1,33 @@
 """
 gap_utils.py
 
-Contains gap-fix and Bybit klines logic for the PostgresDBBot.
-This keeps db_core.py focused on DB/Redis logic and handlers.
+Utility functions for detecting and filling missing kline (candlestick) data in the database for the PostgresDBBot.
+
+This module provides:
+- Automated detection of missing kline intervals (gaps) for all symbols and intervals in the database.
+- Retrieval of missing klines from the Bybit REST API, with support for all standard intervals.
+- Two gap-fill modes:
+    1. **Redis Preprocessing Mode (recommended):** Publishes gap-filled klines to a Redis channel in the same format as live WebSocket klines, so they are processed by the PreprocessorBot (for indicator enrichment, deduplication, and uniform downstream handling).
+    2. **Legacy Direct Insert Mode:** Inserts missing klines directly into the database, bypassing preprocessing.
+- Helper functions for fetching klines from Bybit, inserting klines into the database, and publishing klines to Redis.
+- Keeps db_core.py focused on DB/Redis logic and handlers, while this module handles all gap-filling and kline-fetching logic.
+
+Typical usage:
+- Call `fix_all_data_gaps(db_bot)` to scan all symbols/intervals and fill any detected gaps.
+- The gap-fill mode can be toggled with the `PUBLISH_GAP_KLINES_TO_REDIS` variable at the top of this file.
 """
 import time
 import datetime
 import pandas as pd
 import requests
 import config.config_db as db_config
+import json
+
+# === Gap-fill mode: choose how to handle missing klines ===
+# If True, publish gap-filled klines to Redis for preprocessing (recommended for indicator enrichment)
+# If False, insert directly into the database (legacy behavior)
+PUBLISH_GAP_KLINES_TO_REDIS = True
+
 def fix_all_data_gaps(db_bot):
     """
     Runs fix_data_gaps for all symbols and all intervals.
@@ -82,8 +101,12 @@ def fix_data_gaps(db_bot, symbol, interval, lookback=5000):
                 db_bot.logger.warning(f"Bybit returned {len(klines)} candles for a range that should have only {expected} — slicing to expected")
                 klines = klines[:expected]
             if klines:
-                insert_missing_klines(db_bot, symbol, interval, klines)
-                db_bot.logger.info(f"Inserted {len(klines)} missing klines for gap {start_gap} - {end_gap}")
+                if PUBLISH_GAP_KLINES_TO_REDIS:
+                    publish_klines_to_redis(db_bot, klines, symbol, interval, market=getattr(db_bot, "market", "linear"))
+                    db_bot.logger.info(f"Published {len(klines)} missing klines for gap {start_gap} - {end_gap} to Redis for preprocessing")
+                else:
+                    insert_missing_klines(db_bot, symbol, interval, klines)
+                    db_bot.logger.info(f"Inserted {len(klines)} missing klines for gap {start_gap} - {end_gap}")
             else:
                 db_bot.logger.warning(f"No klines returned for gap {start_gap} - {end_gap}")
     except Exception as e:
@@ -150,3 +173,30 @@ def insert_missing_klines(db_bot, symbol, interval, klines):
         db_bot.logger.error(f"Inserting klines failed: {e}")
     finally:
         cursor.close()
+
+def publish_klines_to_redis(db_bot, klines, symbol, interval, market="linear"):
+    import config.config_redis as config_redis
+    redis_channel = config_redis.REDIS_CHANNEL.get(f"{market}.kline_out")
+    if not redis_channel:
+        db_bot.logger.error(f"No Redis channel found for market {market}")
+        return
+    for k in klines:
+        try:
+            # k[0] is ms timestamp, convert to ISO8601 string
+            iso_time = datetime.datetime.utcfromtimestamp(int(k[0]) / 1000).isoformat()
+            kline_dict = {
+                "symbol": str(symbol),
+                "interval": str(interval),
+                "start_time": iso_time,
+                "open": str(k[1]),
+                "close": str(k[4]),
+                "high": str(k[2]),
+                "low": str(k[3]),
+                "volume": str(k[5]),
+                "turnover": str(k[6]),
+                "confirmed": True
+            }
+            db_bot.redis_handler.publish(redis_channel, json.dumps(kline_dict))
+            db_bot.logger.info(f"Published gap-filled kline for {symbol}-{interval} to {redis_channel}")
+        except Exception as e:
+            db_bot.logger.error(f"❌ Error processing kline for {market}: {e}")

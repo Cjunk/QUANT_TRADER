@@ -216,9 +216,7 @@ class PostgresDBBot:
             self.handle_coin_list_update(data_obj)
         elif channel == config_redis.SERVICE_STATUS_CHANNEL:
             self.status_handler.handle_bot_status_update(data_obj)
-        elif channel == config_redis.REQUEST_COINS:
-            self.logger.info("Received request for coins list.")
-            self._publish_current_coin_list()
+
         elif channel == config_redis.RESYNC_CHANNEL:
             self.logger.info("Received resync signal, publishing coin list.")
             self._publish_current_coin_list()
@@ -558,4 +556,6 @@ class PostgresDBBot:
                 self.save_radar_trade_signal(market, symbol, price, timestamp, data)
             except Exception as e:
                 self.logger.error(f"Error processing radar trade signal: {e}")
+
+
 

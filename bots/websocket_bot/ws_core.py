@@ -68,8 +68,8 @@ class WebSocketBot(threading.Thread):
 
         # ==== Jericho: Market-specific Redis channel ====
         subscription_channel = {
-            "spot": r_cfg.SPOT_SUBSCRIPTION_CHANNEL,
-            "linear": r_cfg.LINEAR_SUBSCRIPTION_CHANNEL,
+            "spot": cfg.SPOT_SUBSCRIPTION_CHANNEL,
+            "linear": cfg.LINEAR_SUBSCRIPTION_CHANNEL,
             "derivatives": getattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL', None)
         }.get(self.market, r_cfg.SPOT_SUBSCRIPTION_CHANNEL)
         self.logger.info(f"[DEBUG] SubscriptionHandler will listen on Redis channel: {subscription_channel}")

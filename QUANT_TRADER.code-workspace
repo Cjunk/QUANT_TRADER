@@ -8,7 +8,8 @@
 		"hide-files.files": [
 			"venv",
 			"Archive",
-			".vscode"
+			".vscode",
+			"QUANT_TRADER.code-workspace"
 		]
 	}
 }

@@ -42,6 +42,8 @@ services:
     depends_on:
       - postgres
       - redis
+    ports:
+      - "8001:8001"
     environment:
       BOT_AUTH_TOKEN: ${DB_BOT_AUTH_TOKEN}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}

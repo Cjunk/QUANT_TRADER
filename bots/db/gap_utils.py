@@ -197,6 +197,6 @@ def publish_klines_to_redis(db_bot, klines, symbol, interval, market="linear"):
                 "confirmed": True
             }
             db_bot.redis_handler.publish(redis_channel, json.dumps(kline_dict))
-            db_bot.logger.info(f"Published gap-filled kline for {symbol}-{interval} to {redis_channel}")
+            db_bot.logger.debug(f"Published gap-filled kline for {symbol}-{interval} to {redis_channel}")
         except Exception as e:
             db_bot.logger.error(f"❌ Error processing kline for {market}: {e}")

@@ -35,6 +35,10 @@ import logging
 import pandas as pd
 import config.config_db as db_config
 import config.config_redis as config_redis
+import uvicorn
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+
 from BOTStatusHandler import BOTStatusHandler
 from utils.db_postgres import PostgresHandler
 from utils.redis_handler import RedisHandler
@@ -196,12 +200,21 @@ class PostgresDBBot:
                 self.publish_websocket_subscriptions(market)
         elif channel == config_redis.DB_SAVE_SUBSCRIPTIONS:
             data = json.loads(raw_message['data'])
-            # Ignore if owner is just the market name
             if data['owner'] in ('spot', 'linear', 'derivatives'):
                 self.logger.info(f"Ignoring subscription save with owner={data['owner']}")
                 return
-            self.save_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
-            self.logger.info(f"Saved subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+
+            action = data.get('action')
+            if action == "remove":
+                self.remove_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
+                self.logger.info(f"Removed subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+            elif action == "set_websocket_subscriptions":
+                self.set_websocket_subscriptions(data['market'], data['symbols'], data['topics'], data['owner'])
+                self.logger.info(f"Set subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+            else:
+                self.set_websocket_subscriptions(data['market'], data['symbols'], data['topics'], data['owner'])
+                self.logger.info(f"Saved subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+
         elif channel in [config_redis.REDIS_CHANNEL["spot.orderbook_delta"], config_redis.REDIS_CHANNEL["linear.orderbook_delta"]]:
             self.handle_orderbook_delta(data_obj)
         elif channel == config_redis.MACRO_METRICS_CHANNEL:
@@ -246,29 +259,68 @@ class PostgresDBBot:
             self.logger.error(f"Error inserting orderbook delta: {e}")
             if self.conn:
                 self.conn.rollback()
+    def query(self, sql: str) -> list[dict]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+            columns = [desc[0] for desc in cur.description]
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
 
-    def save_subscription(self, market: str, symbols: list, topics: list, owner: str):
+
+    def _sync_subscriptions_to_db(self, subscriptions, owner=None):
+        if not owner:
+            self.logger.warning("🛑 Cannot sync subscriptions: missing owner.")
+            return
+
+        # Only include subs that match the owner
+        owner_subs = {
+            sub for sub, meta in subscriptions.items()
+            if meta.get("owner") == owner
+        }
+
+        if not owner_subs:
+            self.logger.info(f"🟡 No subscriptions to sync for owner={owner}")
+            return
+
+        symbols = sorted({sub.split(".")[-1] for sub in owner_subs})
+        topics = sorted({".".join(sub.split(".")[:-1]) for sub in owner_subs})
+        payload = {
+            "action": "set_websocket_subscriptions",
+            "owner": owner,
+            "market": self.market,
+            "symbols": symbols,
+            "topics": topics,
+        }
+        self.logger.info(f"Syncing subscriptions to DB bot: {payload}")
+        self.redis.publish(r_cfg.DB_SAVE_SUBSCRIPTIONS, json.dumps(payload))
+
+
+    def remove_subscription(self, market: str, symbols: list, topics: list, owner: str):
         if not owner:
             return
         cur = self.conn.cursor()
         try:
+            total_removed = 0
             for symbol in symbols:
                 for topic in topics:
                     cur.execute(
                         f"""
-                        INSERT INTO {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions (market, symbol, topic, owner)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (market, symbol, topic) DO UPDATE SET owner = EXCLUDED.owner
+                        DELETE FROM {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions
+                        WHERE market = %s AND symbol = %s AND topic = %s AND owner = %s
                         """,
                         (market, symbol, topic, owner)
                     )
+                    total_removed += cur.rowcount
             self.conn.commit()
-            self.logger.info(f"Saved/updated subscription(s) for owner={owner}")
+            if total_removed > 0:
+                self.logger.info(f"✅ Removed {total_removed} subscription(s) for owner={owner}")
+            else:
+                self.logger.warning(f"⚠️ No matching subscriptions found to remove for owner={owner}")
         except Exception as e:
-            self.logger.error(f"Error saving subscription: {e}")
+            self.logger.error(f"Error removing subscription: {e}")
             self.conn.rollback()
         finally:
             cur.close()
+
 
     def run(self):
         self.logger.info("DB Bot running, starting Redis listener threads...")
@@ -556,6 +608,57 @@ class PostgresDBBot:
                 self.save_radar_trade_signal(market, symbol, price, timestamp, data)
             except Exception as e:
                 self.logger.error(f"Error processing radar trade signal: {e}")
+
+
+
+
+app = FastAPI()
+db_bot_instance = None
+
+@app.on_event("startup")
+def startup_event():
+    global db_bot_instance
+    if db_bot_instance is None:
+        db_bot_instance = PostgresDBBot()
+        threading.Thread(target=db_bot_instance.run, daemon=True).start()
+
+@app.get("/status")
+def get_status():
+    return {
+        "bot_name": db_bot_instance.status["bot_name"],
+        "running": db_bot_instance.running,
+        "pid": db_bot_instance.status["metadata"].get("pid"),
+        "strategy": db_bot_instance.status["metadata"].get("strategy"),
+    }
+
+@app.get("/subscriptions")
+def get_subscriptions(market: str = Query(..., description="Market type, e.g. 'spot' or 'linear'")):
+    subs = db_bot_instance.get_websocket_subscriptions(market)
+    return {"market": market, "subscriptions": subs}
+
+@app.post("/subscriptions")
+def set_subscriptions(
+    market: str,
+    symbols: list[str],
+    topics: list[str],
+    owner: str
+):
+    db_bot_instance.set_websocket_subscriptions(market, symbols, topics, owner)
+    return JSONResponse({"result": "subscriptions updated"})
+
+@app.get("/coins")
+def get_coins():
+    coins = db_bot_instance._retrieve_coins()
+    return {"coins": [row[0] for row in coins]}
+
+@app.post("/stop")
+def stop_bot():
+    db_bot_instance.stop()
+    return {"result": "bot stopped"}
+
+# To run: python db_core.py
+if __name__ == "__main__":
+    uvicorn.run("db_core:app", host="0.0.0.0", port=8001, reload=False)
 
 
 

@@ -23,6 +23,7 @@ Redis Channels Used:
 # =====================================================
 import json, threading, queue, datetime,time, logging, os
 import websocket
+import requests
 
 import config_websocket_bot as cfg
 from utils import setup_logger
@@ -52,7 +53,6 @@ class WebSocketBot(threading.Thread):
     def __init__(self, market):
         super().__init__(daemon=True)
         self.market = market
-        # Set up logger with correct log file and level
         log_level = logging.DEBUG if getattr(cfg, "LOG_LEVEL", "INFO").upper() == "DEBUG" else logging.INFO
         self.logger = setup_logger(f"{market}_ws_core.log", log_level)
         self.redis_handler = RedisHandler(r_cfg, self.logger)
@@ -60,21 +60,15 @@ class WebSocketBot(threading.Thread):
         self.redis = self.redis_handler.client
         self.cmd_q = queue.Queue()
         self.ws = None
-        self.subscriptions = set()
         self.channels = set()
         self.exit_evt = threading.Event()
         self.router = MessageRouter(self.redis, market=market)
-        self.pending_subscriptions = []
-
-        # ==== Jericho: Market-specific Redis channel ====
-        subscription_channel = {
-            "spot": cfg.SPOT_SUBSCRIPTION_CHANNEL,
-            "linear": cfg.LINEAR_SUBSCRIPTION_CHANNEL,
-            "derivatives": getattr(r_cfg, 'DERIVATIVES_SUBSCRIPTION_CHANNEL', None)
-        }.get(self.market, r_cfg.SPOT_SUBSCRIPTION_CHANNEL)
-        self.logger.info(f"[DEBUG] SubscriptionHandler will listen on Redis channel: {subscription_channel}")
-        self.sub_handler = SubscriptionHandler(self.redis, self.cmd_q, subscription_channel=subscription_channel)
-        self.sub_handler.start()
+        # Remove unused pending_subscriptions
+        self.sub_handler = SubscriptionHandler(self.market, self.logger)
+        self.sub_handler.out_q = self.cmd_q  # <-- Wire handler's out_q to bot's cmd_q
+        self.sub_handler.start()             # <-- Start the SubscriptionHandler thread
+        self.subscriptions = self.sub_handler.fetch_subscriptions_from_api()
+        self.protected_symbols = self.sub_handler.fetch_protected_symbols()
 
         # Heartbeat setup
         self.status = {
@@ -102,9 +96,7 @@ class WebSocketBot(threading.Thread):
             metadata=self.status
         )
 
-        # ==== Jericho: Startup State ====
-        self.logger.info(f"[DEBUG] WebSocketBot for market '{self.market}' initialized. Subscriptions Redis key: {self._redis_key()}")
-        self.load_subscriptions_from_db(5)
+        self.logger.info(f"[DEBUG] WebSocketBot for market '{self.market}' initialized.")
         self._connect_ws()
         threading.Thread(target=self._ws_watchdog, daemon=True).start()
 
@@ -172,18 +164,6 @@ class WebSocketBot(threading.Thread):
         else:
             self.logger.info("⚠️ No subscriptions to save.")
 
-    def _load_subscriptions_from_redis(self):
-        """
-        Loads the set of subscriptions from Redis, if any exist, and updates the bot's state.
-        """
-        key = self._redis_key()
-        saved = self.redis.smembers(key)
-        if saved:
-            self.subscriptions = set(saved)
-            self.logger.info(f"🔄 Loaded subscriptions from Redis: {self.market} {self.subscriptions}")
-            self.log_current_subscriptions()
-        else:
-            self.logger.info("⚠️ No subscriptions found in Redis at startup.")
 
     def log_current_subscriptions(self):
         """
@@ -204,53 +184,59 @@ class WebSocketBot(threading.Thread):
         Args:
             cmd (dict): Command dictionary with 'action', 'market', 'symbols', and 'topics'.
         """
+        owner = cmd.get("owner", self.market)
         action = cmd.get("action", "add")
         market = cmd.get("market", "linear")
         symbols = cmd.get("symbols", [])
         channels = cmd.get("topics", ["trade", "orderbook", "kline.1", "kline.5", "kline.60", "kline.D"])
+
         # Enforce symbol cap
         if len(symbols) > MAX_SYMBOLS:
             self.logger.warning(f"⚠️ Symbol limit ({MAX_SYMBOLS}) exceeded. Trimming extra symbols.")
             symbols = symbols[:MAX_SYMBOLS]
+
         # If invalid market, do not change subscriptions
         if market not in cfg.WS_URL:
             self.logger.error(f"⚠️ Invalid market type: {market}")
             return
+
         if market != self.market:
             self.logger.info(f"🔄 Market change detected: {self.market} → {market}")
             self._change_market(market)
-        new_subs = self._build_subscriptions(symbols, channels)
+
+        new_subs_dict = self.sub_handler.build_subscriptions(symbols, channels, owner=owner)
+        new_sub_keys = set(new_subs_dict.keys())  # just the sub keys like "kline.1.ETHUSDT"
+
         if action == "set":
-            self.subscriptions = new_subs
+            self.subscriptions = new_subs_dict
+
         elif action == "add":
-            self.subscriptions |= new_subs
+            new_to_add = {k: v for k, v in new_subs_dict.items() if k not in self.subscriptions}
+            self.subscriptions.update(new_to_add)
+            self.channels -= set(new_to_add.keys())  # Force resubscribe
+            if new_to_add:
+                self.logger.info(f"🔄 Detected new topics to subscribe: {set(new_to_add.keys())}")
+                self._update_subscriptions()
+
         elif action == "remove":
-            self.subscriptions -= new_subs
+            self.logger.debug(f"Subscriptions before removal: {self.subscriptions}")
+            self.logger.debug(f"Attempting to remove: {list(new_sub_keys)}")
+            removed_symbols = set()
+            removed_topics = set()
+            for sub in new_sub_keys:
+                if sub in self.subscriptions:
+                    owner = self.subscriptions[sub].get("owner")
+                    symbol = sub.split(".")[-1]
+                    topic = ".".join(sub.split(".")[:-1])
+                    removed_symbols.add(symbol)
+                    removed_topics.add(topic)
+                    self.subscriptions.pop(sub, None)
+            self.logger.debug(f"Subscriptions after removal: {self.subscriptions}")
+
         self.logger.debug(f"Updated subscriptions: {self.subscriptions}")
         self._update_subscriptions()
-        self._sync_subscriptions_to_db()  # <-- Add this line
+        self.sub_handler._sync_subscriptions_to_db(self.subscriptions, owner=owner)
 
-    def _build_subscriptions(self, symbols, channels):
-        """
-        Constructs a set of subscription topics based on provided symbols and channels.
-        Args:
-            symbols (list): List of symbol strings.
-            channels (list): List of channel/topic strings.
-        Returns:
-            set: Set of subscription topic strings.
-        """
-        subs = set()
-        for sym in symbols:
-            for channel in channels:
-                if channel.startswith("kline."):
-                    interval = channel.split(".")[1]
-                    subs.add(f"kline.{interval}.{sym}")
-                elif channel.startswith("orderbook"):
-                    depth = channel.split(".")[1] if "." in channel else cfg.ORDER_BOOK_DEPTH
-                    subs.add(f"orderbook.{depth}.{sym}")
-                elif channel == "trade":
-                    subs.add(f"publicTrade.{sym}")
-        return subs
 
     def _change_market(self, new_market):
         """
@@ -284,47 +270,45 @@ class WebSocketBot(threading.Thread):
     # Jericho: Subscription Management
     # =====================================================
     def _update_subscriptions(self):
-        """
-        Updates the WebSocket with the current set of subscriptions.
-        Handles subscribing and unsubscribing in batches, and logs all changes.
-        """
         if not self.ws or not self.ws.sock or not self.ws.sock.connected:
             self.logger.warning("⚠️ WebSocket disconnected; subscriptions delayed.")
             return
-        new_subs, curr_channels = self.subscriptions, set(self.channels)
+
+        new_subs, curr_channels = set(self.subscriptions), set(self.channels)
         to_sub, to_unsub = new_subs - curr_channels, curr_channels - new_subs
 
-        # Debug: Log what we are about to subscribe/unsubscribe
         self.logger.info(f"[DEBUG] _update_subscriptions: to_sub={to_sub}, to_unsub={to_unsub}, curr_channels={curr_channels}, new_subs={new_subs}")
 
-        # Jericho: Reset sequence for new subscriptions
-        for sub in to_sub:
+        for sub in list(to_sub):
             parts = sub.split(".")
             if len(parts) >= 3:
                 symbol = parts[2]
                 self.logger.debug(f"Resetting sequence for symbol: {symbol}")
                 self.router.reset_seq(symbol)
-        # Jericho: Unsubscribe
+
+        # Use protected_symbols from handler
+        to_unsub = {s for s in to_unsub if (s.split(".")[-1], self.market) not in self.protected_symbols}
+
         if to_unsub:
             self.logger.info(f"🚫 Unsubscribing from {len(to_unsub)} topics")
             for i in range(0, len(to_unsub), BATCH_SIZE):
                 batch = list(to_unsub)[i:i+BATCH_SIZE]
                 self.logger.info(f"[DEBUG] Sending unsubscribe batch: {batch}")
                 self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
-                self.logger.debug(f"Unsubscribed batch: {batch}")
             self.channels -= to_unsub
-        # Jericho: Subscribe
+
         if to_sub:
             self.logger.info(f"✅ Subscribing to {len(to_sub)} new topics")
             for i in range(0, len(to_sub), BATCH_SIZE):
                 batch = list(to_sub)[i:i+BATCH_SIZE]
                 self.logger.info(f"[DEBUG] Sending subscribe batch: {batch}")
                 self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
-                self.logger.debug(f"Subscribed batch: {batch}")
             self.channels |= to_sub
+
         if not to_sub and not to_unsub:
             self.logger.info("🟢 No subscription changes needed.")
         self.log_current_subscriptions()
+
 
     # =====================================================
     # Jericho: WebSocket Connection
@@ -379,12 +363,11 @@ class WebSocketBot(threading.Thread):
     # =====================================================
     def _ws_watchdog(self):
         """
-        Background thread that ensures the WebSocket is connected and flushes pending subscriptions.
+        Background thread that ensures the WebSocket is connected.
         Runs every 5 seconds until the bot is stopped.
         """
         while not self.exit_evt.is_set():
-            if self.ws and self.ws.sock and self.ws.sock.connected:
-                self._flush_pending()
+            # No need to flush pending subscriptions
             self.exit_evt.wait(5)
 
     # =====================================================
@@ -469,62 +452,10 @@ class WebSocketBot(threading.Thread):
         except Exception as exc:
             self.logger.error(f"Parse fail: {exc}  ¹ first 120 chars: {raw[:120]}")
 
-    def request_subscriptions_from_db(self):
-        """
-        Requests subscriptions from the database bot via Redis.
-        """
-        self.logger.info("Requesting subscriptions from the database bot...")
-        payload = json.dumps({"action": "request_subscriptions", "owner": self.market})
-        self.redis.publish(r_cfg.DB_REQUEST_SUBSCRIPTIONS, payload)
 
-    def subscribe_to_db_subscriptions(self):
-        """
-        Subscribes to the subscriptions retrieved from the database bot.
-        """
-        self.logger.info("Subscribing to database subscriptions...")
-        key = self._redis_key()
-        saved_subscriptions = self.redis.smembers(key)
-        if saved_subscriptions:
-            self.subscriptions = set(saved_subscriptions)
-            self._update_subscriptions()
-            self.logger.info(f"Subscribed to {len(saved_subscriptions)} subscriptions from the database bot.")
-        else:
-            self.logger.warning("No subscriptions found in Redis.")
 
-    def load_subscriptions_from_db(self, timeout=5):
-        """
-        Requests subscriptions from the database bot and loads them from Redis.
-        Waits up to `timeout` seconds for the DB bot to respond.
-        """
-        self.logger.info("Requesting subscriptions from the database bot...")
-        payload = json.dumps({"action": "request_subscriptions", "owner": self.market})
-        self.redis.publish(r_cfg.DB_REQUEST_SUBSCRIPTIONS, payload)
 
-        key = self._redis_key()
-        start = time.time()
-        while time.time() - start < timeout:
-            saved = self.redis.smembers(key)
-            if saved:
-                self.subscriptions = set(saved)
-                self.logger.info(f"🔄 Loaded subscriptions from DB via Redis: {self.market} {self.subscriptions}")
-                self.log_current_subscriptions()
-                return
-            time.sleep(0.5)
-        self.logger.warning(f"⚠️ No subscriptions found in Redis for {self.market} after {timeout} seconds.")
 
-    def _sync_subscriptions_to_db(self):
-        """
-        Publishes the current subscriptions to the database bot via Redis.
-        """
-        payload = {
-            "action": "set_websocket_subscriptions",
-            "owner": self.market,
-            "market": self.market,
-            "symbols": sorted({sub.split(".")[-1] for sub in self.subscriptions}),
-            "topics": sorted({sub.split(".")[0] for sub in self.subscriptions}),
-        }
-        self.logger.info(f"Syncing subscriptions to DB bot: {payload}")
-        self.redis.publish(r_cfg.DB_SAVE_SUBSCRIPTIONS, json.dumps(payload))
 
 
 

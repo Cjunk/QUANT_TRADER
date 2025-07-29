@@ -21,7 +21,7 @@ Redis Channels Used:
 # =====================================================
 # Jericho: Imports and Config
 # =====================================================
-import json, threading, queue, datetime,time, logging, os
+import json, threading, queue, datetime, time, logging, os
 import websocket
 import requests
 
@@ -30,7 +30,6 @@ from utils import setup_logger
 from utils.redis_handler import RedisHandler
 from utils.HeartBeatService import HeartBeat
 from config import config_redis as r_cfg
-#from config import config_common as common_cfg
 from subscription_handler import SubscriptionHandler, MAX_SYMBOLS
 from message_router import MessageRouter
 from websocket_utils import send_webhook
@@ -40,11 +39,11 @@ from websocket_utils import send_webhook
 # =====================================================
 BATCH_SIZE = getattr(cfg, "BATCH_SIZE", 10)
 PING_SEC, PONG_TIMEOUT, REOPEN_SEC = 20, 10, 2
+CAPTURE_ORDER_DELTAS = True
 
 # =====================================================
 # Jericho: WebSocketBot Class
 # =====================================================
-CAPTURE_ORDER_DELTAS = True
 class WebSocketBot(threading.Thread):
     """
     Jericho: Professional, minimal, and robust WebSocket trading bot core.
@@ -63,12 +62,15 @@ class WebSocketBot(threading.Thread):
         self.channels = set()
         self.exit_evt = threading.Event()
         self.router = MessageRouter(self.redis, market=market)
-        # Remove unused pending_subscriptions
-        self.sub_handler = SubscriptionHandler(self.market, self.logger)
-        self.sub_handler.out_q = self.cmd_q  # <-- Wire handler's out_q to bot's cmd_q
-        self.sub_handler.start()             # <-- Start the SubscriptionHandler thread
-        self.subscriptions = self.sub_handler.fetch_subscriptions_from_api()
-        self.protected_symbols = self.sub_handler.fetch_protected_symbols()
+        self.sub_handler = SubscriptionHandler(
+            self.market, self.logger,
+            reset_seq_callback=self.router.reset_seq,
+            update_ws_subscriptions=self._update_subscriptions
+        )
+        self.sub_handler.ws = self.ws
+        self.sub_handler.ws_update_callback = self._update_subscriptions
+        self.sub_handler.out_q = self.cmd_q
+        self.sub_handler.start()
 
         # Heartbeat setup
         self.status = {
@@ -82,7 +84,7 @@ class WebSocketBot(threading.Thread):
                 "strategy": getattr(cfg, "STRATEGY_NAME", "-"),
                 "vitals": {
                     "market": self.market,
-                    "subscriptions": sorted(list(self.subscriptions)),
+                    "subscriptions": sorted(list(self.sub_handler.subscriptions)),
                     "kline_count": getattr(self, "kline_count", 0),
                     "timestamp": datetime.datetime.utcnow().isoformat(),
                 }
@@ -104,29 +106,77 @@ class WebSocketBot(threading.Thread):
     # Jericho: Main Run Loop
     # =====================================================
     def run(self):
-        """
-        Main thread loop for the WebSocketBot.
-        Processes commands from the queue and exits cleanly when the exit event is set.
-        """
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot started.")
         self.logger.info(f"🚀 WebSocketBot running. {self.market}")
         while not self.exit_evt.is_set():
             try:
-                cmd = self.cmd_q.get(timeout=1)
-                self.logger.debug(f"Received command: {cmd}")
-                self._handle_command(cmd)
+                self.logger.debug("[DEBUG][run] Waiting for command in cmd_q...")
+                new_subs = self.cmd_q.get(timeout=1)
+                self.logger.debug(f"[DEBUG][run] Got new subscriptions from cmd_q: {new_subs} (type={type(new_subs)})")
+                self._update_subscriptions(new_subs)
             except queue.Empty:
+                self.logger.debug("[DEBUG][run] cmd_q is empty, continuing loop.")
                 continue
+
+
+    def _update_subscriptions(self, new_subs):
+        self.logger.debug(f"[DEBUG][_update_subscriptions] called with: {new_subs} (type={type(new_subs)})")
+        if not self.ws:
+            self.logger.error("[DEBUG][_update_subscriptions] WebSocket object is None!")
+            return
+        if not self.ws.sock:
+            self.logger.error("[DEBUG][_update_subscriptions] WebSocket.sock is None!")
+            return
+        if not self.ws.sock.connected:
+            self.logger.warning("[DEBUG][_update_subscriptions] WebSocket not connected, skipping update.")
+            return
+
+        self.logger.info(f"[DEBUG][_update_subscriptions] Preparing to update live subscriptions. Current channels: {self.channels}")
+        self.logger.info(f"[DEBUG][_update_subscriptions] New subscriptions requested: {new_subs}")
+
+        # Debug: Show difference between current and new
+        to_sub = set(new_subs) - self.channels
+        to_unsub = self.channels - set(new_subs)
+        self.logger.info(f"[DEBUG][_update_subscriptions] to_sub={to_sub}, to_unsub={to_unsub}")
+
+        # Unsubscribe from topics not in new_subs
+        if to_unsub:
+            for batch_start in range(0, len(to_unsub), BATCH_SIZE):
+                batch = list(to_unsub)[batch_start:batch_start+BATCH_SIZE]
+                self.logger.info(f"[DEBUG][_update_subscriptions] Unsubscribing from batch: {batch}")
+                try:
+                    self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
+                    self.logger.info(f"[DEBUG][_update_subscriptions] Unsubscribed from batch: {batch}")
+                except Exception as e:
+                    self.logger.error(f"[DEBUG][_update_subscriptions] Failed to unsubscribe batch {batch}: {e}")
+        self.channels -= to_unsub
+
+        # Subscribe to new topics
+        if to_sub:
+            for batch_start in range(0, len(to_sub), BATCH_SIZE):
+                batch = list(to_sub)[batch_start:batch_start+BATCH_SIZE]
+                self.logger.info(f"[DEBUG][_update_subscriptions] Subscribing to batch: {batch}")
+                try:
+                    self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
+                    self.logger.info(f"[DEBUG][_update_subscriptions] Subscribed to batch: {batch}")
+                except Exception as e:
+                    self.logger.error(f"[DEBUG][_update_subscriptions] Failed to subscribe batch {batch}: {e}")
+        self.channels |= to_sub
+
+        if not to_sub and not to_unsub:
+            self.logger.info("[DEBUG][_update_subscriptions] No subscription changes needed.")
+
+        # Final state
+        self.logger.info(f"[DEBUG][_update_subscriptions] Final channels: {self.channels}")
 
     # =====================================================
     # Jericho: Shutdown Logic
     # =====================================================
     def stop(self):
-        """
-        Cleanly shuts down the WebSocketBot.
-        Closes the WebSocket, stops the subscription handler, and saves subscriptions to Redis.
-        """
-        if self.exit_evt.is_set(): return
+        self.logger.info("[DEBUG][stop] Called stop()")
+        if self.exit_evt.is_set():
+            self.logger.info("[DEBUG][stop] exit_evt already set, returning.")
+            return
         self.logger.info("🛑 Shutting down...")
         self.exit_evt.set()
         if self.ws and self.ws.sock:
@@ -135,228 +185,41 @@ class WebSocketBot(threading.Thread):
                 self.logger.info("🟢 WebSocket closed successfully.")
             except Exception as e:
                 self.logger.warning(f"⚠️ WebSocket close failed: {e}")
-        if self.sub_handler: self.sub_handler.stop()
-        self._save_subscriptions_to_redis()
+        if self.sub_handler:
+            self.logger.info("[DEBUG][stop] Stopping sub_handler...")
+            self.sub_handler.stop()
+            self.logger.info("[DEBUG][stop] Saving subscriptions to Redis...")
+            self.sub_handler._save_subscriptions_to_redis()
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
         self.logger.info("✅ Shutdown complete.")
-
-    # =====================================================
-    # Jericho: Redis Subscription State
-    # =====================================================
-    def _redis_key(self):
-        """
-        Returns the Redis key for storing subscriptions for the current market.
-        Returns:
-            str: Redis key string.
-        """
-        return f"{r_cfg.REDIS_SUBSCRIPTION_KEY}:{self.market}"
-
-    def _save_subscriptions_to_redis(self):
-        """
-        Saves the current set of subscriptions to Redis for persistence across restarts.
-        If there are no subscriptions, deletes the key.
-        """
-        key = self._redis_key()
-        self.redis.delete(key)
-        if self.subscriptions:
-            self.redis.sadd(key, *self.subscriptions)
-            self.logger.info(f"💾 Saved current subscriptions to Redis: {self.market} {self.subscriptions}")
-        else:
-            self.logger.info("⚠️ No subscriptions to save.")
-
-
-    def log_current_subscriptions(self):
-        """
-        Logs the current active subscriptions for the market.
-        """
-        if self.subscriptions:
-            self.logger.info(f"📡 [{self.market.upper()}] Current subscriptions ({len(self.subscriptions)}): {', '.join(sorted(self.subscriptions))}")
-        else:
-            self.logger.info(f"📡 [{self.market.upper()}] No active subscriptions.")
-
-    # =====================================================
-    # Jericho: Command Handling
-    # =====================================================
-    def _handle_command(self, cmd):
-        """
-        Handles incoming subscription commands from the queue.
-        Supports 'add', 'remove', and 'set' actions for symbols and channels.
-        Args:
-            cmd (dict): Command dictionary with 'action', 'market', 'symbols', and 'topics'.
-        """
-        owner = cmd.get("owner", self.market)
-        action = cmd.get("action", "add")
-        market = cmd.get("market", "linear")
-        symbols = cmd.get("symbols", [])
-        channels = cmd.get("topics", ["trade", "orderbook", "kline.1", "kline.5", "kline.60", "kline.D"])
-
-        # Enforce symbol cap
-        if len(symbols) > MAX_SYMBOLS:
-            self.logger.warning(f"⚠️ Symbol limit ({MAX_SYMBOLS}) exceeded. Trimming extra symbols.")
-            symbols = symbols[:MAX_SYMBOLS]
-
-        # If invalid market, do not change subscriptions
-        if market not in cfg.WS_URL:
-            self.logger.error(f"⚠️ Invalid market type: {market}")
-            return
-
-        if market != self.market:
-            self.logger.info(f"🔄 Market change detected: {self.market} → {market}")
-            self._change_market(market)
-
-        new_subs_dict = self.sub_handler.build_subscriptions(symbols, channels, owner=owner)
-        new_sub_keys = set(new_subs_dict.keys())  # just the sub keys like "kline.1.ETHUSDT"
-
-        if action == "set":
-            self.subscriptions = new_subs_dict
-
-        elif action == "add":
-            new_to_add = {k: v for k, v in new_subs_dict.items() if k not in self.subscriptions}
-            self.subscriptions.update(new_to_add)
-            self.channels -= set(new_to_add.keys())  # Force resubscribe
-            if new_to_add:
-                self.logger.info(f"🔄 Detected new topics to subscribe: {set(new_to_add.keys())}")
-                self._update_subscriptions()
-
-        elif action == "remove":
-            self.logger.debug(f"Subscriptions before removal: {self.subscriptions}")
-            self.logger.debug(f"Attempting to remove: {list(new_sub_keys)}")
-            removed_symbols = set()
-            removed_topics = set()
-            for sub in new_sub_keys:
-                if sub in self.subscriptions:
-                    owner = self.subscriptions[sub].get("owner")
-                    symbol = sub.split(".")[-1]
-                    topic = ".".join(sub.split(".")[:-1])
-                    removed_symbols.add(symbol)
-                    removed_topics.add(topic)
-                    self.subscriptions.pop(sub, None)
-            self.logger.debug(f"Subscriptions after removal: {self.subscriptions}")
-
-        self.logger.debug(f"Updated subscriptions: {self.subscriptions}")
-        self._update_subscriptions()
-        self.sub_handler._sync_subscriptions_to_db(self.subscriptions, owner=owner)
-
-
-    def _change_market(self, new_market):
-        """
-        Handles switching the bot to a new market type.
-        Closes the current WebSocket, clears state, and reconnects to the new market.
-        Args:
-            new_market (str): The new market type to switch to.
-        """
-        if new_market == self.market:
-            self.logger.info(f"🔵 Market unchanged ({new_market}), no action taken.")
-            return
-        # Invalid market check
-        if new_market not in cfg.WS_URL:
-            self.logger.error(f"⚠️ Invalid market type: {new_market}")
-            return  # Exit gracefully
-        self.logger.info(f"🔄 Market change detected: {self.market} → {new_market}")
-        if self.ws:
-            try:
-                self.ws.close()
-                self.logger.info("🟢 WebSocket closed for market change.")
-            except Exception as e:
-                self.logger.warning(f"⚠️ Error closing WebSocket: {e}")
-            finally:
-                self.ws = None
-        self.channels.clear()
-        self.subscriptions.clear()
-        self.market = new_market
-        self._connect_ws()
-
-    # =====================================================
-    # Jericho: Subscription Management
-    # =====================================================
-    def _update_subscriptions(self):
-        if not self.ws or not self.ws.sock or not self.ws.sock.connected:
-            self.logger.warning("⚠️ WebSocket disconnected; subscriptions delayed.")
-            return
-
-        new_subs, curr_channels = set(self.subscriptions), set(self.channels)
-        to_sub, to_unsub = new_subs - curr_channels, curr_channels - new_subs
-
-        self.logger.info(f"[DEBUG] _update_subscriptions: to_sub={to_sub}, to_unsub={to_unsub}, curr_channels={curr_channels}, new_subs={new_subs}")
-
-        for sub in list(to_sub):
-            parts = sub.split(".")
-            if len(parts) >= 3:
-                symbol = parts[2]
-                self.logger.debug(f"Resetting sequence for symbol: {symbol}")
-                self.router.reset_seq(symbol)
-
-        # Use protected_symbols from handler
-        to_unsub = {s for s in to_unsub if (s.split(".")[-1], self.market) not in self.protected_symbols}
-
-        if to_unsub:
-            self.logger.info(f"🚫 Unsubscribing from {len(to_unsub)} topics")
-            for i in range(0, len(to_unsub), BATCH_SIZE):
-                batch = list(to_unsub)[i:i+BATCH_SIZE]
-                self.logger.info(f"[DEBUG] Sending unsubscribe batch: {batch}")
-                self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
-            self.channels -= to_unsub
-
-        if to_sub:
-            self.logger.info(f"✅ Subscribing to {len(to_sub)} new topics")
-            for i in range(0, len(to_sub), BATCH_SIZE):
-                batch = list(to_sub)[i:i+BATCH_SIZE]
-                self.logger.info(f"[DEBUG] Sending subscribe batch: {batch}")
-                self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
-            self.channels |= to_sub
-
-        if not to_sub and not to_unsub:
-            self.logger.info("🟢 No subscription changes needed.")
-        self.log_current_subscriptions()
-
 
     # =====================================================
     # Jericho: WebSocket Connection
     # =====================================================
     def _connect_ws(self):
-        """
-        Establishes and maintains the WebSocket connection for the current market.
-        Handles reconnection logic and triggers subscription updates on connect.
-        """
         url = cfg.WS_URL[self.market] if self.market in cfg.WS_URL else cfg.WS_URL["spot"]
+        self.logger.info(f"[DEBUG][_connect_ws] Connecting to WebSocket at URL: {url}")
         def _runner():
             while not self.exit_evt.is_set():
+                self.logger.info("[DEBUG][_connect_ws] Creating WebSocketApp...")
                 self.ws = websocket.WebSocketApp(
                     url,
-                    on_open=lambda ws: (self.logger.info("WS connected"), self._update_subscriptions()),
+                    on_open=lambda ws: (
+                        self.logger.info("[DEBUG][_connect_ws] WS connected"),
+                        self._update_subscriptions(set(self.sub_handler.subscriptions.keys()))
+                    ),
                     on_message=self._on_message,
-                    on_error=lambda ws, err: self.logger.error(f"WS error: {err}"),
-                    on_close=lambda *_: (self.logger.warning("WS closed"), self.channels.clear()),
-                    on_pong=lambda *_: self.logger.debug("pong"),
+                    on_error=lambda ws, err: self.logger.error(f"[DEBUG][_connect_ws] WS error: {err}"),
+                    on_close=lambda *_: (self.logger.warning("[DEBUG][_connect_ws] WS closed"), self.sub_handler.channels.clear()),
+                    on_pong=lambda *_: self.logger.debug("[DEBUG][_connect_ws] pong"),
                 )
+                self.logger.info("[DEBUG][_connect_ws] Starting run_forever...")
                 self.ws.run_forever(ping_interval=PING_SEC, ping_timeout=PONG_TIMEOUT)
+                self.sub_handler.ws = self.ws
                 if not self.exit_evt.is_set():
-                    self.logger.warning(f"Reconnecting WS in {REOPEN_SEC}s...")
+                    self.logger.warning(f"[DEBUG][_connect_ws] Reconnecting WS in {REOPEN_SEC}s...")
                     time.sleep(REOPEN_SEC)
         threading.Thread(target=_runner, daemon=True).start()
-
-    # =====================================================
-    # Jericho: Pending Subscription Flush
-    # =====================================================
-    def _flush_pending(self):
-        """
-        Sends any pending subscriptions to the WebSocket in batches.
-        Handles connection errors gracefully and clears the pending list on success.
-        """
-        if not self.pending_subscriptions: return
-        if not self.ws or not self.ws.sock or not self.ws.sock.connected:
-            self.logger.warning("⚠️ WebSocket not connected yet, delaying subscription.")
-            return
-        self.logger.info(f"✅ Subscribing to {len(self.pending_subscriptions)} new topics")
-        for i in range(0, len(self.pending_subscriptions), BATCH_SIZE):
-            batch = self.pending_subscriptions[i:i+BATCH_SIZE]
-            try:
-                self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
-            except websocket.WebSocketConnectionClosedException:
-                self.logger.warning("⚠️ WebSocket unexpectedly closed during subscription.")
-                self.ws = None
-                return
-        self.pending_subscriptions.clear()
 
     # =====================================================
     # Jericho: Watchdog & Heartbeat

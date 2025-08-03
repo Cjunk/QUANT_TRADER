@@ -200,20 +200,48 @@ class PostgresDBBot:
                 self.publish_websocket_subscriptions(market)
         elif channel == config_redis.DB_SAVE_SUBSCRIPTIONS:
             data = json.loads(raw_message['data'])
+            
             if data['owner'] in ('spot', 'linear', 'derivatives'):
                 self.logger.info(f"Ignoring subscription save with owner={data['owner']}")
                 return
 
             action = data.get('action')
-            if action == "remove":
-                self.remove_subscription(data['market'], data['symbols'], data['topics'], data['owner'])
-                self.logger.info(f"Removed subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
-            elif action == "set_websocket_subscriptions":
-                self.set_websocket_subscriptions(data['market'], data['symbols'], data['topics'], data['owner'])
-                self.logger.info(f"Set subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+
+            if action == "add":
+                self.save_subscription(
+                    data["symbol"],
+                    data["market"],
+                    data.get("topics", ["trade", "kline", "orderbook"]),
+                    data["owner"]
+                )
+                self.logger.info(f"Added subscription: market={data['market']}, symbol={data['symbol']}, topics={data.get('topics')}, owner={data['owner']}")
+
+            elif action == "remove":
+                for topic in data.get("topics", ["trade", "kline", "orderbook"]):
+                    self.remove_subscription(
+                        data["market"],
+                        [data["symbol"]],
+                        [topic],
+                        data["owner"]
+                    )
+                    self.logger.info(
+                        f"Removed subscription: market={data['market']}, symbol={data['symbol']}, "
+                        f"topic={topic}, owner={data['owner']}"
+                    )
+                self.logger.info(f"Removed subscription: market={data['market']}, symbol={data['symbol']}, owner={data['owner']}")
+
+            elif action == "set":
+                self.set_websocket_subscriptions(
+                    data["market"],
+                    data["symbols"],
+                    data["topics"],
+                    data["owner"]
+                )
+                self.logger.info(f"Set subscriptions: market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+
             else:
-                self.set_websocket_subscriptions(data['market'], data['symbols'], data['topics'], data['owner'])
-                self.logger.info(f"Saved subscription for market={data['market']}, symbols={data['symbols']}, topics={data['topics']}, owner={data['owner']}")
+                self.logger.warning(f"Unknown subscription action received: {action}")
+
 
         elif channel in [config_redis.REDIS_CHANNEL["spot.orderbook_delta"], config_redis.REDIS_CHANNEL["linear.orderbook_delta"]]:
             self.handle_orderbook_delta(data_obj)
@@ -609,6 +637,38 @@ class PostgresDBBot:
             except Exception as e:
                 self.logger.error(f"Error processing radar trade signal: {e}")
 
+    def save_subscription(self, symbol: str, market: str, topics: list, owner: str):
+        """
+        Save a single symbol + topic subscription set into the database.
+        Each topic will be saved as a separate row for the symbol.
+        """
+        if not all([symbol, market, owner]):
+            self.logger.warning("Missing fields in save_subscription call.")
+            return
+
+        cursor = self.conn.cursor()
+        try:
+            rows = []
+            for topic in topics:
+                rows.append((market, symbol, topic, owner))
+
+            if rows:
+                query = f"""
+                    INSERT INTO {db_config.DB_TRADING_SCHEMA}.websocket_subscriptions (market, symbol, topic, owner)
+                    VALUES %s
+                    ON CONFLICT (market, symbol, topic, owner) DO NOTHING
+                """
+                execute_values(cursor, query, rows)
+                self.conn.commit()
+                self.logger.info(f"✅ Saved {len(rows)} subscription(s): market={market}, symbol={symbol}, owner={owner}")
+            else:
+                self.logger.warning("🟡 No topics provided, nothing inserted.")
+
+        except Exception as e:
+            self.logger.error(f"Error saving subscription: {e}")
+            self.conn.rollback()
+        finally:
+            cursor.close()
 
 
 

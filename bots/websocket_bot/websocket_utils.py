@@ -1,4 +1,4 @@
-import logging, requests
+import requests
 from config_websocket_bot import LOG_LEVEL
 
 

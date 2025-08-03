@@ -23,7 +23,6 @@ Redis Channels Used:
 # =====================================================
 import json, threading, queue, datetime, time, logging, os
 import websocket
-import requests
 
 import config_websocket_bot as cfg
 from utils import setup_logger
@@ -110,17 +109,17 @@ class WebSocketBot(threading.Thread):
         self.logger.info(f"🚀 WebSocketBot running. {self.market}")
         while not self.exit_evt.is_set():
             try:
-                self.logger.debug("[DEBUG][run] Waiting for command in cmd_q...")
+                #self.logger.debug("[DEBUG][run] Waiting for command in cmd_q...")
                 new_subs = self.cmd_q.get(timeout=1)
                 self.logger.debug(f"[DEBUG][run] Got new subscriptions from cmd_q: {new_subs} (type={type(new_subs)})")
                 self._update_subscriptions(new_subs)
             except queue.Empty:
-                self.logger.debug("[DEBUG][run] cmd_q is empty, continuing loop.")
+                #self.logger.debug("[DEBUG][run] cmd_q is empty, continuing loop.")
                 continue
 
 
     def _update_subscriptions(self, new_subs):
-        self.logger.debug(f"[DEBUG][_update_subscriptions] called with: {new_subs} (type={type(new_subs)})")
+        self.logger.debug(f"*************** [DEBUG][_update_subscriptions] called with: {new_subs} (type={type(new_subs)})")
         if not self.ws:
             self.logger.error("[DEBUG][_update_subscriptions] WebSocket object is None!")
             return
@@ -131,7 +130,7 @@ class WebSocketBot(threading.Thread):
             self.logger.warning("[DEBUG][_update_subscriptions] WebSocket not connected, skipping update.")
             return
 
-        self.logger.info(f"[DEBUG][_update_subscriptions] Preparing to update live subscriptions. Current channels: {self.channels}")
+        self.logger.debug(f"[DEBUG][_update_subscriptions] Preparing to update live subscriptions. Current channels: {self.channels}")
         self.logger.info(f"[DEBUG][_update_subscriptions] New subscriptions requested: {new_subs}")
 
         # Debug: Show difference between current and new
@@ -143,7 +142,7 @@ class WebSocketBot(threading.Thread):
         if to_unsub:
             for batch_start in range(0, len(to_unsub), BATCH_SIZE):
                 batch = list(to_unsub)[batch_start:batch_start+BATCH_SIZE]
-                self.logger.info(f"[DEBUG][_update_subscriptions] Unsubscribing from batch: {batch}")
+                self.logger.debug(f"[DEBUG][_update_subscriptions] Unsubscribing from batch: {batch}")
                 try:
                     self.ws.send(json.dumps({"op": "unsubscribe", "args": batch}))
                     self.logger.info(f"[DEBUG][_update_subscriptions] Unsubscribed from batch: {batch}")
@@ -173,7 +172,7 @@ class WebSocketBot(threading.Thread):
     # Jericho: Shutdown Logic
     # =====================================================
     def stop(self):
-        self.logger.info("[DEBUG][stop] Called stop()")
+        self.logger.debug("[DEBUG][stop] Called stop()")
         if self.exit_evt.is_set():
             self.logger.info("[DEBUG][stop] exit_evt already set, returning.")
             return
@@ -186,26 +185,26 @@ class WebSocketBot(threading.Thread):
             except Exception as e:
                 self.logger.warning(f"⚠️ WebSocket close failed: {e}")
         if self.sub_handler:
-            self.logger.info("[DEBUG][stop] Stopping sub_handler...")
+            self.logger.debug("[DEBUG][stop] Stopping sub_handler...")
             self.sub_handler.stop()
-            self.logger.info("[DEBUG][stop] Saving subscriptions to Redis...")
+            self.logger.debug("[DEBUG][stop] Saving subscriptions to Redis...")
             self.sub_handler._save_subscriptions_to_redis()
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
-        self.logger.info("✅ Shutdown complete.")
+        self.logger.debug("✅ Shutdown complete.")
 
     # =====================================================
     # Jericho: WebSocket Connection
     # =====================================================
     def _connect_ws(self):
         url = cfg.WS_URL[self.market] if self.market in cfg.WS_URL else cfg.WS_URL["spot"]
-        self.logger.info(f"[DEBUG][_connect_ws] Connecting to WebSocket at URL: {url}")
+        self.logger.debug(f"[DEBUG][_connect_ws] Connecting to WebSocket at URL: {url}")
         def _runner():
             while not self.exit_evt.is_set():
-                self.logger.info("[DEBUG][_connect_ws] Creating WebSocketApp...")
+                self.logger.debug("[DEBUG][_connect_ws] Creating WebSocketApp...")
                 self.ws = websocket.WebSocketApp(
                     url,
                     on_open=lambda ws: (
-                        self.logger.info("[DEBUG][_connect_ws] WS connected"),
+                        self.logger.debug("[DEBUG][_connect_ws] WS connected"),
                         self._update_subscriptions(set(self.sub_handler.subscriptions.keys()))
                     ),
                     on_message=self._on_message,
@@ -213,7 +212,7 @@ class WebSocketBot(threading.Thread):
                     on_close=lambda *_: (self.logger.warning("[DEBUG][_connect_ws] WS closed"), self.sub_handler.channels.clear()),
                     on_pong=lambda *_: self.logger.debug("[DEBUG][_connect_ws] pong"),
                 )
-                self.logger.info("[DEBUG][_connect_ws] Starting run_forever...")
+                self.logger.debug("[DEBUG][_connect_ws] Starting run_forever...")
                 self.ws.run_forever(ping_interval=PING_SEC, ping_timeout=PONG_TIMEOUT)
                 self.sub_handler.ws = self.ws
                 if not self.exit_evt.is_set():

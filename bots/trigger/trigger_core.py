@@ -1,21 +1,51 @@
 # --- trigger_core.py ---
 """
 TriggerBot Core Logic
+
 Author: Jericho | 2025-05-25
 
-Professional, modular, and production-grade trend trigger bot for quant trading.
-Handles kline analysis, emits signals, and maintains heartbeat/status for monitoring.
+Description:
+-------------
+This is the main engine for the TriggerBot, a modular, production-grade trend trigger bot for quant trading.
+It listens to kline (candlestick) updates from Redis, analyzes trends using technical indicators (RSI, MACD, Bollinger Bands, etc.),
+emits trading signals, logs them to PostgreSQL, and maintains a heartbeat/status for monitoring.
+
+Redis Integration:
+------------------
+- Subscribes to:
+    * PRE_PROC_KLINE_UPDATES (from config.config_redis): Receives pre-processed kline/candle updates for all symbols/intervals.
+- Publishes to:
+    * TRIGGER_QUEUE_CHANNEL (from config.config_redis): Pushes generated trading signals as JSON objects for downstream consumers.
+    * SERVICE_STATUS_CHANNEL: Publishes bot status (started/stopped) and metadata for monitoring.
+
+Data Flow:
+----------
+- On startup, preloads recent kline data for all subscribed symbols/intervals from PostgreSQL.
+- Listens to PRE_PROC_KLINE_UPDATES via Redis pubsub, updating rolling windows for each symbol/interval.
+- When a window is full, analyzes the trend and emits signals if criteria are met.
+- Signals include trend triggers, strong MACD/Bollinger events, and volume spikes.
+- Each signal is logged to PostgreSQL and pushed to TRIGGER_QUEUE_CHANNEL for other bots/services.
+- Maintains a heartbeat/status via HeartBeatService and publishes status updates to SERVICE_STATUS_CHANNEL.
+
+Other Details:
+--------------
+- Symbol list is refreshed from the DB every 30 minutes to dynamically add new coins.
+- All major actions and errors are logged for monitoring and debugging.
+- DEV_MODE enables more aggressive signal emission for testing purposes.
 """
 
 import os
 import sys
 import time
+from utils.global_indicators import GlobalIndicators  # adjust import path
 import json
 import threading
 import pandas as pd
 import datetime
 import logging
 import pytz
+import requests
+
 from utils.redis_handler import RedisHandler
 from utils.db_postgres import PostgresHandler
 import config.config_redis as config_redis
@@ -47,11 +77,13 @@ class TriggerBot:
     MA_WINDOW = 5 if DEV_MODE else 200
     MIN_CONFIDENCE = 20 if DEV_MODE else 65
 
-    def __init__(self):
+    def __init__(self,market="spot"):
         self.logger = setup_logger(LOG_FILENAME, logging.INFO)
         self.running = True
+        self.indicators = GlobalIndicators()
         self.redis_handler = RedisHandler(config_redis, self.logger)
         self.redis_handler.connect()
+        self.market = market
         self.redis_client = self.redis_handler.client
         self.pubsub = self.redis_handler.pubsub
         self.logger.info(f"TriggerBot config: WINDOW_SIZE={self.WINDOW_SIZE}, MA_WINDOW={self.MA_WINDOW}, MIN_CONFIDENCE={self.MIN_CONFIDENCE}, DEV_MODE={self.DEV_MODE}")
@@ -108,42 +140,63 @@ class TriggerBot:
         except Exception as e:
             self.logger.error(f"❌ Failed to connect to Postgres: {e}")
             sys.exit(1)
-
+    def get_enriched_daily_klines(self,symbol: str) -> pd.DataFrame:
+        df = self.fetch_bybit_klines(symbol, interval="D", limit=200)
+        df = self.indicators.compute_indicators(df)
+        return df
     # === Data Preload ===
     def preload_recent_klines(self):
-        """Preload recent kline data for all symbols/intervals from DB."""
-        self.logger.info("preload_recent_klines")
+        """Preload recent kline data (only 'kline.*') for subscribed symbols in current market."""
+        self.logger.info("🔄 preload_recent_klines started")
         try:
             cursor = self.db_conn.cursor()
             cursor.execute("SET search_path TO trading;")
-            cursor.execute("SELECT DISTINCT symbol FROM websocket_subscriptions;")
-            symbols = [row[0] for row in cursor.fetchall()]
-            for symbol in symbols:
-                for interval in ["1", "5", "60", "D"]:
-                    cursor.execute(f"""
-                        SELECT symbol, interval, start_time, close, rsi, macd, macd_signal, macd_hist, ma, upper_band, lower_band, volume, volume_ma, volume_change, volume_slope, rvol, open, high, low, turnover, confirmed, market
-                        FROM kline_data
-                        WHERE symbol = %s AND interval = %s
-                        ORDER BY start_time DESC
-                        LIMIT {self.WINDOW_SIZE}
-                    """, (symbol, interval))
-                    rows = cursor.fetchall()
-                    if rows:
-                        rows.reverse()
-                        self.windows[(symbol, interval)] = [
-                            {
-                                "symbol": r[0], "interval": r[1], "start_time": r[2], "close": r[3],
-                                "RSI": r[4], "MACD": r[5], "MACD_Signal": r[6], "MACD_Hist": r[7], "MA": r[8],
-                                "UpperBand": r[9], "LowerBand": r[10], "volume": r[11], "Volume_MA": r[12],
-                                "Volume_Change": r[13], "Volume_Slope": r[14], "RVOL": r[15], "open": r[16],
-                                "high": r[17], "low": r[18], "turnover": r[19], "confirmed": r[20], "market": r[21]
-                            } for r in rows
-                        ]
-                        self.logger.info(f"✅ Preloaded {len(rows)} candles for {symbol}-{interval}")
+            cursor.execute("SELECT symbol, topic, market FROM websocket_subscriptions WHERE market = %s;", (self.market,))
+            all_rows = cursor.fetchall()
+
+            symbol_intervals = {}
+            for symbol, topic, market in all_rows:
+                if topic.startswith("kline."):
+                    interval = topic.split(".")[1]
+                    symbol_intervals.setdefault(symbol, set()).add(interval)
+
+            for symbol, intervals in symbol_intervals.items():
+                intervals.add("D")  # Always include daily for bias
+                for interval in intervals:
+                    if interval == "D":
+                        try:
+                            df = self.fetch_bybit_klines(symbol, interval="D", limit=self.WINDOW_SIZE)
+                            df = self.indicators.compute_indicators(df)
+                            df = df.tail(self.WINDOW_SIZE)
+                            self.windows[(symbol, interval)] = df.to_dict(orient="records")
+                            self.logger.info(f"✅ Preloaded {len(df)} daily candles from Bybit for {symbol}-D")
+                        except Exception as e:
+                            self.logger.warning(f"⚠️ Failed to fetch daily klines from Bybit for {symbol}: {e}")
+                    else:
+                        cursor.execute(f"""
+                            SELECT symbol, interval, start_time, close, rsi, macd, macd_signal, macd_hist, ma,
+                                upper_band, lower_band, volume, volume_ma, volume_change, volume_slope, rvol,
+                                open, high, low, turnover, confirmed, market
+                            FROM kline_data
+                            WHERE symbol = %s AND interval = %s AND market = %s
+                            ORDER BY start_time DESC
+                            LIMIT {self.WINDOW_SIZE}
+                        """, (symbol, interval, self.market))
+                        rows = cursor.fetchall()
+                        if rows:
+                            rows.reverse()
+                            self.windows[(symbol, interval)] = [dict(zip(
+                                ["symbol", "interval", "start_time", "close", "RSI", "MACD", "MACD_Signal", "MACD_Hist", "MA",
+                                "UpperBand", "LowerBand", "volume", "Volume_MA", "Volume_Change", "Volume_Slope", "RVOL",
+                                "open", "high", "low", "turnover", "confirmed", "market"], r)) for r in rows]
+                            self.logger.info(f"✅ Preloaded {len(rows)} candles from DB for {symbol}-{interval}")
+
             cursor.close()
         except Exception as e:
             self.logger.error(f"❌ Preloading klines failed: {e}")
             sys.exit(1)
+
+
 
     # === Redis Listener ===
     def _start_redis_listener(self):
@@ -476,7 +529,23 @@ class TriggerBot:
 
             except Exception as e:
                 self.logger.error(f"❌ Error refreshing symbols: {e}")
-
+    def fetch_bybit_klines(self,symbol: str, interval: str = "D", limit: int = 200) -> pd.DataFrame:
+        url = "https://api.bybit.com/v5/market/kline"
+        params = {
+            "category": self.market,
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        }
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()["result"]["list"]
+        df = pd.DataFrame(data, columns=[
+            "start_time", "open", "high", "low", "close", "volume", "turnover"
+        ])
+        df = df.astype(float)
+        df["start_time"] = pd.to_datetime(df["start_time"], unit="ms")
+        return df
 if __name__ == "__main__":
     if sys.prefix == sys.base_prefix:
         print("❌ Virtual environment is NOT activated. Please activate it first.")

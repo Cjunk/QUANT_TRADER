@@ -32,7 +32,7 @@ class StealthTrader:
         executor: TradeExecutor instance for placing orders.
     """
 
-    def __init__(self, symbol="BTCUSDT", market="linear", bot_id=1001, required_consistency=1,
+    def __init__(self, symbol="BTCUSDT", market="linear", bot_id=1001, required_consistency=2,
                  consistent_count=0, decision_interval=30, trigger_score=3, letherage_max=10):
         self.symbol = symbol  # Trading symbol
         self.market = market  # Market type (e.g., "linear")

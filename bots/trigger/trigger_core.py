@@ -1,382 +1,199 @@
-# --- trigger_core.py ---
-"""
-TriggerBot Core Logic
-
-Author: Jericho | 2025-05-25
-
-Description:
--------------
-This is the main engine for the TriggerBot, a modular, production-grade trend trigger bot for quant trading.
-It listens to kline (candlestick) updates from Redis, analyzes trends using technical indicators (RSI, MACD, Bollinger Bands, etc.),
-emits trading signals, logs them to PostgreSQL, and maintains a heartbeat/status for monitoring.
-
-Redis Integration:
-------------------
-- Subscribes to:
-    * PRE_PROC_KLINE_UPDATES (from config.config_redis): Receives pre-processed kline/candle updates for all symbols/intervals.
-- Publishes to:
-    * TRIGGER_QUEUE_CHANNEL (from config.config_redis): Pushes generated trading signals as JSON objects for downstream consumers.
-    * SERVICE_STATUS_CHANNEL: Publishes bot status (started/stopped) and metadata for monitoring.
-
-Data Flow:
-----------
-- On startup, preloads recent kline data for all subscribed symbols/intervals from PostgreSQL.
-- Listens to PRE_PROC_KLINE_UPDATES via Redis pubsub, updating rolling windows for each symbol/interval.
-- When a window is full, analyzes the trend and emits signals if criteria are met.
-- Signals include trend triggers, strong MACD/Bollinger events, and volume spikes.
-- Each signal is logged to PostgreSQL and pushed to TRIGGER_QUEUE_CHANNEL for other bots/services.
-- Maintains a heartbeat/status via HeartBeatService and publishes status updates to SERVICE_STATUS_CHANNEL.
-
-Other Details:
---------------
-- Symbol list is refreshed from the DB every 30 minutes to dynamically add new coins.
-- All major actions and errors are logged for monitoring and debugging.
-- DEV_MODE enables more aggressive signal emission for testing purposes.
-"""
-
-import os
-import sys
-import time
-from utils.global_indicators import GlobalIndicators  # adjust import path
-import json
-import threading
+# Step 2: minimal TriggerBot + analysis preview. Still Redis-only; now computes a confidence and can enqueue a test signal.
+import os, sys, json, threading, time
+from typing import Optional
 import pandas as pd
-import datetime
-import logging
-import pytz
-import requests
-
-from utils.redis_handler import RedisHandler
-from utils.db_postgres import PostgresHandler
-import config.config_redis as config_redis
-
-import config_trigger_bot as cfg
-# --- Path and Encoding Setup ---
+# If running as a script inside /bots/trigger
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if os.name == 'nt':
-    sys.stdout.reconfigure(encoding='utf-8')
 
-# --- Config Imports ---
-from config.config_db import (
-    DB_HOST, DB_PORT, DB_DATABASE, DB_USER, DB_PASSWORD
-)
-from config_trigger_bot import BOT_NAME, LOG_FILENAME, LOG_LEVEL,BOT_AUTH_TOKEN
-from config.config_redis import PRE_PROC_KLINE_UPDATES, TRIGGER_QUEUE_CHANNEL
 from utils.logger import setup_logger
-from utils.HeartBeatService import HeartBeat
+from utils.redis_handler import RedisHandler
+import config.config_redis as redis_cfg
+from config.config_redis import PRE_PROC_KLINE_UPDATES, TRIGGER_QUEUE_CHANNEL
+import pandas as pd
+from utils.db_postgres import PostgresHandler
 
-import psycopg2
+# Config (keep tiny)
+WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "25"))
+LOG_FILENAME = os.getenv("LOG_FILENAME", "trigger_bot.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+MIN_CONFIDENCE = 30
+FORCE_SIGNAL = os.getenv("FORCE_SIGNAL", "0") == "1"
 
-# === TriggerBot Class ===
+# one global logger to avoid duplicate handlers
+logger = setup_logger(LOG_FILENAME, LOG_LEVEL)
+
+
 class TriggerBot:
-    """
-    Trend trigger bot for quant trading. Listens to kline updates, analyzes trends, emits signals, and maintains heartbeat.
-    """
-    WINDOW_SIZE = 20
-    DEV_MODE = True  # Set False for production
-    MA_WINDOW = 5 if DEV_MODE else 200
-    MIN_CONFIDENCE = 20 if DEV_MODE else 65
+    """Minimal bot: subscribe to kline updates, check Redis window length, log it, and compute confidence."""
 
-    def __init__(self,market="spot"):
-        self.logger = setup_logger(LOG_FILENAME, logging.INFO)
-        self.running = True
-        self.indicators = GlobalIndicators()
-        self.redis_handler = RedisHandler(config_redis, self.logger)
-        self.redis_handler.connect()
+    def __init__(self, market: str):
         self.market = market
-        self.redis_client = self.redis_handler.client
-        self.pubsub = self.redis_handler.pubsub
-        self.logger.info(f"TriggerBot config: WINDOW_SIZE={self.WINDOW_SIZE}, MA_WINDOW={self.MA_WINDOW}, MIN_CONFIDENCE={self.MIN_CONFIDENCE}, DEV_MODE={self.DEV_MODE}")
-        self.logger.debug(f"PubSub object created: {self.pubsub}")
-        self.logger.debug(f"Preparing to subscribe to Redis channel: {PRE_PROC_KLINE_UPDATES!r}")
-        subscribe_response = self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
-        self.logger.info(f"Subscribed to Redis channel: {PRE_PROC_KLINE_UPDATES!r}, subscribe() response: {subscribe_response}")
-        if hasattr(self.pubsub, 'channels'):
-            self.logger.debug(f"Current pubsub channels: {list(self.pubsub.channels.keys())}")
-        else:
-            self.logger.debug("PubSub object does not have 'channels' attribute.")
+        self.logger = logger
+        self.running = True
         self.db = PostgresHandler(self.logger)
         self.db_conn = self.db.conn
-        self.windows = {}
-        self.heartbeat_interval = 30
-        self.bot_name = BOT_NAME
-        self.auth_token = BOT_AUTH_TOKEN
-        self.version = "1.0.0"
-        self.strategy = "trend_trigger"
-        # HeartBeat setup (like ws_core.py)
-        self.status = {
-            "bot_name": self.bot_name,
-            "status": "started",
-            "time": datetime.datetime.utcnow().isoformat(),
-            "auth_token": self.auth_token,
-            "metadata": {
-                "version": self.version,
-                "pid": os.getpid(),
-                "strategy": self.strategy,
-                "vitals": {}
-            }
-        }
-        self.heartbeat = HeartBeat(
-            bot_name=self.bot_name,
-            auth_token=self.auth_token,
-            logger=self.logger,
-            redis_handler=self.redis_handler,
-            metadata=self.status
-        )
-        self.logger.debug("TriggerBot __init__ complete. All handlers and connections set up.")
+        # Redis
+        self.redis = RedisHandler(redis_cfg, self.logger)
+        self.redis.connect()
+        self.client = self.redis.client
+        self.pubsub = self.redis.pubsub
+        self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
+        self.logger.info(f"[{self.market}] Subscribed to {PRE_PROC_KLINE_UPDATES!r}; WINDOW_SIZE={WINDOW_SIZE}")
+        self.last_emitted = {}  # {(market, symbol, interval): last_candle_start_iso}
 
-    # === Setup Methods ===
-    def connect_postgres(self):
-        """Connect to PostgreSQL database using consistent logic."""
+    # ---- Redis helpers ----
+    def _window_key(self, symbol: str, interval: str) -> str:
+        return f"kline_window:{self.market}:{symbol}:{interval}"
+
+    def _llen(self, key: str) -> int:
         try:
-            self.db_conn = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                dbname=DB_DATABASE,
-                user=DB_USER,
-                password=DB_PASSWORD
+            n = self.client.llen(key)
+            return int(n or 0)
+        except Exception as e:
+            self.logger.warning(f"LLEN failed for {key}: {e}")
+            return 0
+
+    def _read_window(self, symbol: str, interval: str):
+        key = self._window_key(symbol, interval)
+        items = self.client.lrange(key, -WINDOW_SIZE, -1) or []
+        out = []
+        for it in items:
+            try:
+                out.append(json.loads(it))
+            except Exception:
+                pass
+        return out
+    def _insert_signal_log(self, *, symbol, interval, signal_type,
+                        value=None, context=None, confidence=None,
+                        direction=None, window_start=None, window_end=None):
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO trading.signal_log
+                (symbol, "interval", signal_type, value, context, confidence, direction, window_start, window_end)
+                VALUES
+                (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+            """, (
+                symbol, interval, signal_type,
+                float(value) if value is not None else None,
+                json.dumps(context or {}),
+                float(confidence) if confidence is not None else None,
+                direction,
+                window_start,  # naive timestamp OK (table is TIMESTAMP WITHOUT TIME ZONE)
+                window_end
+            ))
+            self.db_conn.commit()
+            self.logger.info(f"🧠 logged to DB: {signal_type} {symbol}-{interval}")
+        except Exception as e:
+            self.db_conn.rollback()
+            self.logger.error(f"❌ DB insert failed: {e}", exc_info=True)
+        finally:
+            cur.close()
+
+    # ---- Listener ----
+    def listen(self):
+        for message in self.pubsub.listen():
+            if not self.running:
+                break
+            if message.get("type") != "message":
+                continue
+            try:
+                payload = json.loads(message["data"])  # expected: {symbol, interval, market}
+            except Exception as e:
+                self.logger.error(f"JSON decode error: {e} | raw={message.get('data')!r}")
+                continue
+
+            mkt = payload.get("market")
+            sym = payload.get("symbol")
+            iv  = payload.get("interval")
+            
+
+            if not (mkt and sym and iv) or mkt != self.market:
+                continue
+            self.logger.info(f"[rx] {mkt} {sym}-{iv}")
+            key = self._window_key(sym, iv)
+            n = self._llen(key)
+            ready = n >= WINDOW_SIZE
+            status = "READY" if ready else f"{n}/{WINDOW_SIZE}"
+            self.logger.info(f"[{self.market}] {sym}-{iv} window: {status} | {key}")
+
+            if ready:
+                try:
+                    self.analyze(sym, iv)
+                except Exception as e:
+                    self.logger.error(f"analyze failed for {sym}-{iv}: {e}", exc_info=True)
+
+    # ---- Analysis (preview) ----
+    def analyze(self, symbol: str, interval: str):
+        win = self._read_window(symbol, interval)
+        if len(win) < WINDOW_SIZE:
+            return
+        df = pd.DataFrame(win)
+
+        # -- only act on confirmed candles (if field exists)
+        if "confirmed" in df.columns and not bool(df["confirmed"].iloc[-1]):
+            return
+
+        # -- dedupe: only one signal per candle start_time
+        dedupe_ts = None
+        if "start_time" in df.columns:
+            last_ts = pd.to_datetime(df["start_time"].iloc[-1], utc=True, errors="coerce")
+            if pd.notna(last_ts):
+                dedupe_ts = last_ts.tz_convert(None).isoformat()
+                key = (self.market, symbol, interval)
+                if self.last_emitted.get(key) == dedupe_ts:
+                    return
+
+        # required + optional columns
+        req = ["close", "volume", "Volume_MA", "RSI", "MACD", "MACD_Signal"]
+        opt_bands = ["UpperBand", "LowerBand"]
+
+        if any(c not in df.columns for c in req):
+            self.logger.info(f"[{self.market}] {symbol}-{interval} waiting for indicators; have cols={sorted(df.columns)}")
+            return
+
+        # numeric cast
+        for c in req:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in opt_bands:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # require the 'req' columns to be non-null; bands are optional
+        df = df.dropna(subset=req)
+        if len(df) < WINDOW_SIZE:
+            return
+
+        # confidence preview
+        rvol = float(df["volume"].iloc[-1]) / (float(df["Volume_MA"].iloc[-1]) + 1e-8)
+        price_slope = (df["close"].iloc[-1] - df["close"].iloc[0]) / max(df["close"].iloc[0], 1e-8)
+        rsi_slope   = (df["RSI"].iloc[-1]   - df["RSI"].iloc[0])   / 100.0
+        macd_slope  = (df["MACD"].iloc[-1]  - df["MACD"].iloc[0])  / (abs(df["MACD"].iloc[0]) + 1e-8)
+
+        price_score = min(max(price_slope, -0.05), 0.05) / 0.05
+        rsi_score   = min(max(rsi_slope,   -0.5),  0.5)  / 0.5
+        macd_score  = min(max(macd_slope,  -1.0),  1.0)
+        rvol_score  = min(rvol / 3.0, 1.0)
+        confidence  = (price_score*0.4 + rsi_score*0.25 + macd_score*0.2 + rvol_score*0.15) * 100.0
+
+        # log (include bands if present)
+        if all(b in df.columns for b in opt_bands):
+            self.logger.info(
+                f"[{self.market}] {symbol}-{interval} conf={confidence:.1f} "
+                f"rvol={rvol:.2f} rsi={df['RSI'].iloc[-1]:.1f} macd={df['MACD'].iloc[-1]:.2f} "
+                f"bb=({df['LowerBand'].iloc[-1]:.2f},{df['UpperBand'].iloc[-1]:.2f})"
             )
-            self.logger.info("✅ Connected to PostgreSQL.")
-        except Exception as e:
-            self.logger.error(f"❌ Failed to connect to Postgres: {e}")
-            sys.exit(1)
-    def get_enriched_daily_klines(self,symbol: str) -> pd.DataFrame:
-        df = self.fetch_bybit_klines(symbol, interval="D", limit=200)
-        df = self.indicators.compute_indicators(df)
-        return df
-    # === Data Preload ===
-    def preload_recent_klines(self):
-        """Preload recent kline data (only 'kline.*') for subscribed symbols in current market."""
-        self.logger.info("🔄 preload_recent_klines started")
-        try:
-            cursor = self.db_conn.cursor()
-            cursor.execute("SET search_path TO trading;")
-            cursor.execute("SELECT symbol, topic, market FROM websocket_subscriptions WHERE market = %s;", (self.market,))
-            all_rows = cursor.fetchall()
-
-            symbol_intervals = {}
-            for symbol, topic, market in all_rows:
-                if topic.startswith("kline."):
-                    interval = topic.split(".")[1]
-                    symbol_intervals.setdefault(symbol, set()).add(interval)
-
-            for symbol, intervals in symbol_intervals.items():
-                intervals.add("D")  # Always include daily for bias
-                for interval in intervals:
-                    if interval == "D":
-                        try:
-                            df = self.fetch_bybit_klines(symbol, interval="D", limit=self.WINDOW_SIZE)
-                            df = self.indicators.compute_indicators(df)
-                            df = df.tail(self.WINDOW_SIZE)
-                            self.windows[(symbol, interval)] = df.to_dict(orient="records")
-                            self.logger.info(f"✅ Preloaded {len(df)} daily candles from Bybit for {symbol}-D")
-                        except Exception as e:
-                            self.logger.warning(f"⚠️ Failed to fetch daily klines from Bybit for {symbol}: {e}")
-                    else:
-                        cursor.execute(f"""
-                            SELECT symbol, interval, start_time, close, rsi, macd, macd_signal, macd_hist, ma,
-                                upper_band, lower_band, volume, volume_ma, volume_change, volume_slope, rvol,
-                                open, high, low, turnover, confirmed, market
-                            FROM kline_data
-                            WHERE symbol = %s AND interval = %s AND market = %s
-                            ORDER BY start_time DESC
-                            LIMIT {self.WINDOW_SIZE}
-                        """, (symbol, interval, self.market))
-                        rows = cursor.fetchall()
-                        if rows:
-                            rows.reverse()
-                            self.windows[(symbol, interval)] = [dict(zip(
-                                ["symbol", "interval", "start_time", "close", "RSI", "MACD", "MACD_Signal", "MACD_Hist", "MA",
-                                "UpperBand", "LowerBand", "volume", "Volume_MA", "Volume_Change", "Volume_Slope", "RVOL",
-                                "open", "high", "low", "turnover", "confirmed", "market"], r)) for r in rows]
-                            self.logger.info(f"✅ Preloaded {len(rows)} candles from DB for {symbol}-{interval}")
-
-            cursor.close()
-        except Exception as e:
-            self.logger.error(f"❌ Preloading klines failed: {e}")
-            sys.exit(1)
-
-
-
-    # === Redis Listener ===
-    def _start_redis_listener(self):
-        self.logger.debug("Starting Redis listener thread...")
-        threading.Thread(target=self.listen_redis, daemon=True).start()
-
-    def listen_redis(self):
-        self.logger.debug(f"listen_redis() started. pubsub={self.pubsub}")
-        msg_count = 0
-        # Debug: print all channels this pubsub is listening to
-        if hasattr(self.pubsub, 'channels'):
-            self.logger.debug(f"PubSub channels at listen start: {list(self.pubsub.channels.keys())}")
         else:
-            self.logger.debug("PubSub object does not have 'channels' attribute at listen start.")
-        while self.running:
-            self.logger.debug("Waiting for Redis messages...")
-            for message in self.pubsub.listen():
-                msg_count += 1
-                #self.logger.debug(f"[Redis] Message #{msg_count}: {message}")
-                if message["type"] == "message":
-                    try:
-                        #self.logger.debug(f"[Redis] Raw data: {message['data']}")
-                        payload = json.loads(message["data"])
-                        self.logger.debug(f"[Redis] Decoded payload: {payload}")
-                        self.process_kline(payload)
-                    except json.JSONDecodeError as e:
-                        self.logger.error(f"❌ JSON decode error: {e} | Raw data: {message['data']}")
-                    except Exception as e:
-                        self.logger.error(f"❌ Error handling kline message: {e} | Message: {message}", exc_info=True)
-                else:
-                    self.logger.debug(f"[Redis] Non-data message: {message}")
-
-    # === Kline Processing ===
-    def process_kline(self, payload):
-        self.logger.debug(f"Processing kline payload: {payload}")
-        symbol = payload.get("symbol")
-        interval = payload.get("interval")
-        key = (symbol, interval)
-        if key not in self.windows:
-            self.logger.debug(f"Creating new window for {key}")
-            self.windows[key] = []
-        self.windows[key].append(payload)
-        self.logger.debug(f"Window for {key} now has {len(self.windows[key])} entries")
-        if len(self.windows[key]) > self.WINDOW_SIZE:
-            removed = self.windows[key].pop(0)
-            self.logger.debug(f"Removed oldest entry from window for {key}: {removed}")
-        if len(self.windows[key]) == self.WINDOW_SIZE:
-            self.logger.debug(f"Window for {key} is full, analyzing trend...")
-            self.analyze_trend(key)
-        else:
-            self.logger.debug(f"Window for {key} not full yet ({len(self.windows[key])}/{self.WINDOW_SIZE})")
-
-    def analyze_trend(self, key):
-        symbol, interval = key
-        DEV_MODE = self.DEV_MODE
-        MA_WINDOW = self.MA_WINDOW
-        MIN_CONFIDENCE = self.MIN_CONFIDENCE
-        try:
-            df_raw = pd.DataFrame(self.windows[key])
-            self.logger.debug(f"Raw DataFrame for {key}:\n{df_raw}")
-            df = df_raw.dropna()
-            self.logger.debug(f"Cleaned DataFrame for {key}:\n{df}")
-
-            df.loc[:, "start_time"] = pd.to_datetime(df["start_time"], utc=True).dt.tz_convert(None)
-            if len(df) < self.WINDOW_SIZE:
-                self.logger.debug(f"Not enough candles for {key}: {len(df)} < {self.WINDOW_SIZE}")
-                return
-
-            numeric_cols = ["close", "RSI", "MACD", "MACD_Signal", "Volume_MA", "volume", "UpperBand", "LowerBand"]
-            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-            self.logger.debug(f"Numeric columns converted for {key}.")
-
-            close = df["close"].iloc[-1]
-            volume = df["volume"].iloc[-1]
-            volume_ma = df["Volume_MA"].iloc[-1]
-            macd_now = df["MACD"].iloc[-1]
-            macd_signal_now = df["MACD_Signal"].iloc[-1]
-            rsi_now = df["RSI"].iloc[-1]
-            upper_band = df["UpperBand"].iloc[-1]
-            lower_band = df["LowerBand"].iloc[-1]
-            rvol = volume / (volume_ma + 1e-8)
-
-            price_slope = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0]
-            rsi_slope = (df["RSI"].iloc[-1] - df["RSI"].iloc[0]) / 100
-            macd_slope = (df["MACD"].iloc[-1] - df["MACD"].iloc[0]) / (abs(df["MACD"].iloc[0]) + 1e-8)
-
-            price_score = min(max(price_slope, -0.05), 0.05) / 0.05
-            rsi_score = min(max(rsi_slope, -0.5), 0.5) / 0.5
-            macd_score = min(max(macd_slope, -1), 1)
-            rvol_score = min(rvol / 3, 1)
-            confidence = (price_score * 0.4 + rsi_score * 0.25 + macd_score * 0.2 + rvol_score * 0.15) * 100
-
-            self.logger.debug(
-                f"[Trend] {key} | close={close}, volume={volume}, volume_ma={volume_ma}, "
-                f"macd_now={macd_now}, macd_signal_now={macd_signal_now}, rsi_now={rsi_now}, "
-                f"upper_band={upper_band}, lower_band={lower_band}, rvol={rvol}, "
-                f"price_slope={price_slope}, rsi_slope={rsi_slope}, macd_slope={macd_slope}, confidence={confidence}"
+            self.logger.info(
+                f"[{self.market}] {symbol}-{interval} conf={confidence:.1f} "
+                f"rvol={rvol:.2f} rsi={df['RSI'].iloc[-1]:.1f} macd={df['MACD'].iloc[-1]:.2f}"
             )
 
-            window_start = pd.to_datetime(df["start_time"].min())
-            window_end = pd.to_datetime(df["start_time"].max())
-            local_tz = pytz.timezone("Australia/Sydney")
-            window_info = f"{window_start.tz_localize('UTC').astimezone(local_tz)} ➔ {window_end.tz_localize('UTC').astimezone(local_tz)}"
+        # emit if forced or over threshold
+        if FORCE_SIGNAL or confidence >= MIN_CONFIDENCE:
+            direction = "long" if df["close"].iloc[-1] >= df["close"].iloc[-2] else "short"
 
-            daily_key = (symbol, "D")
-            daily_df = pd.DataFrame(self.windows.get(daily_key, []))
-            daily_bias = "neutral"
-            if len(daily_df) >= MA_WINDOW:
-                daily_df["close"] = pd.to_numeric(daily_df["close"], errors='coerce')
-                daily_ma = daily_df["close"].rolling(window=MA_WINDOW).mean().iloc[-1]
-                daily_close = daily_df["close"].iloc[-1]
-                if not pd.isna(daily_ma):
-                    daily_bias = "bullish" if daily_close > daily_ma else "bearish"
-                else:
-                    self.logger.warning(f"⚠️ MA{MA_WINDOW} NaN, defaulting daily bias to neutral.")
-            else:
-                self.logger.warning(f"⚠️ Insufficient daily data (<{MA_WINDOW}), using neutral daily bias.")
-
-            self.logger.debug(f"[Trend] {key} | daily_bias={daily_bias}")
-
-            if confidence >= MIN_CONFIDENCE and abs(price_slope) > 0.003 and rvol > 0.8:
-                direction = "long" if price_slope > 0 else "short"
-                self.logger.debug(f"[Trigger] {key} | direction={direction}, confidence={confidence}, rvol={rvol}")
-
-                if DEV_MODE or daily_bias == "neutral" or \
-                (direction == "long" and daily_bias == "bullish") or \
-                (direction == "short" and daily_bias == "bearish"):
-                    self.logger.info(
-                        f"\n⚡ {'[DEV MODE]' if DEV_MODE else ''} Trend Trigger\n"
-                        f"Symbol: {symbol} | Interval: {interval}\n"
-                        f"Trend: {'📈 UP' if direction == 'long' else '📉 DOWN'} (Daily Bias: {daily_bias})\n"
-                        f"Confidence: {confidence:.2f}% | RVOL: {rvol:.2f}x\n"
-                        f"Price Δ: {price_slope:.2%} | RSI Δ: {rsi_slope:.2%} | MACD Δ: {macd_slope:.2%}\n"
-                        f"Latest Close: {close:.2f} | RSI: {rsi_now:.2f} | MACD: {macd_now:.4f} | MACD Signal: {macd_signal_now:.4f}\n"
-                        f"Bollinger Bands: Upper={upper_band:.2f}, Lower={lower_band:.2f}\n"
-                        f"Window: {window_info}"
-                    )
-                    self.emit_signal("trend_trigger", symbol, interval, df, value=confidence,
-                                    direction=direction, confidence=confidence,
-                                    window=(window_start, window_end))
-                else:
-                    self.logger.info(f"⚠️ Skipped trend trigger (daily bias mismatch: {daily_bias}).")
-
-            if len(df) >= 2:
-                macd_prev, macd_signal_prev = df["MACD"].iloc[-2], df["MACD_Signal"].iloc[-2]
-                bullish_cross = macd_prev < macd_signal_prev and macd_now > macd_signal_now and close > upper_band
-                bearish_cross = macd_prev > macd_signal_prev and macd_now < macd_signal_now and close < lower_band
-
-                self.logger.debug(
-                    f"[MACD/Bollinger] {key} | macd_prev={macd_prev}, macd_signal_prev={macd_signal_prev}, "
-                    f"bullish_cross={bullish_cross}, bearish_cross={bearish_cross}, rvol={rvol}, rsi_now={rsi_now}"
-                )
-
-                if bullish_cross and rvol > 2 and rsi_now > 55 and (DEV_MODE or daily_bias == "bullish"):
-                    self.logger.info(
-                        f"\n🚀 {'[DEV MODE]' if DEV_MODE else ''} Strong Bullish MACD+Bollinger\n"
-                        f"{symbol}-{interval} | RVOL: {rvol:.2f}x | Window: {window_info}"
-                    )
-                    self.emit_signal("strong_bullish_trigger", symbol, interval, df, value=macd_now,
-                                    direction="long", confidence=75.0, window=(window_start, window_end))
-
-                elif bearish_cross and rvol > 2 and rsi_now < 45 and (DEV_MODE or daily_bias == "bearish"):
-                    self.logger.info(
-                        f"\n⚠️ {'[DEV MODE]' if DEV_MODE else ''} Strong Bearish MACD+Bollinger\n"
-                        f"{symbol}-{interval} | RVOL: {rvol:.2f}x | Window: {window_info}"
-                    )
-                    self.emit_signal("strong_bearish_trigger", symbol, interval, df, value=macd_now,
-                                    direction="short", confidence=75.0, window=(window_start, window_end))
-
-            if rvol > 4:
-                self.logger.info(
-                    f"\n📈 Volume Spike Detected\nSymbol: {symbol} | Interval: {interval}\n"
-                    f"RVOL: {rvol:.2f}x | Window: {window_info}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"❌ Trend analysis failed: {e}", exc_info=True)
-
-    def emit_signal(self, signal_type, symbol, interval, df, value=None, direction=None, confidence=None, window=None):
-        try:
+            # context (includes bands if present)
             context = {
                 "close": float(df["close"].iloc[-1]),
                 "volume": float(df["volume"].iloc[-1]),
@@ -384,173 +201,67 @@ class TriggerBot:
                 "rsi": float(df["RSI"].iloc[-1]),
                 "macd": float(df["MACD"].iloc[-1]),
                 "macd_signal": float(df["MACD_Signal"].iloc[-1]),
-                "upper_band": float(df["UpperBand"].iloc[-1]),
-                "lower_band": float(df["LowerBand"].iloc[-1]),
+                "market": self.market,
             }
-            self.logger.debug(
-                f"Emitting signal: {signal_type} | symbol={symbol}, interval={interval}, value={value}, "
-                f"direction={direction}, confidence={confidence}, window={window}, context={context}"
+            if "UpperBand" in df.columns:
+                context["upper_band"] = float(df["UpperBand"].iloc[-1])
+            if "LowerBand" in df.columns:
+                context["lower_band"] = float(df["LowerBand"].iloc[-1])
+
+            # window times
+            window_start = window_end = None
+            if "start_time" in df.columns:
+                ts_all = pd.to_datetime(df["start_time"], utc=True, errors="coerce")
+                if len(ts_all.dropna()) > 0:
+                    window_start = ts_all.min().tz_convert(None).to_pydatetime()
+                    window_end   = ts_all.max().tz_convert(None).to_pydatetime()
+
+            # queue payload
+            payload = {
+                "symbol": symbol,
+                "interval": interval,
+                "signal_type": "trend_confidence" if not FORCE_SIGNAL else "test_force",
+                "value": round(float(confidence), 2),
+                "confidence": round(float(confidence), 2),
+                "market": self.market,
+                "direction": direction,
+                "context": context,
+                "window_start": window_start.isoformat() if window_start else None,
+                "window_end": window_end.isoformat() if window_end else None,
+            }
+            self.client.rpush(TRIGGER_QUEUE_CHANNEL, json.dumps(payload))
+            self.logger.info(f"queued signal -> {payload}")
+
+            # DB insert
+            self._insert_signal_log(
+                symbol=symbol, interval=interval, signal_type=payload["signal_type"],
+                value=payload["value"], context=context, confidence=payload["confidence"],
+                direction=direction, window_start=window_start, window_end=window_end
             )
-            self.log_signal(
-                symbol, interval,
-                signal_type=signal_type,
-                value=value,
-                context=context,
-                direction=direction,
-                confidence=confidence,
-                window=window
-            )
-        except Exception as e:
-            self.logger.error(f"❌ emit_signal failed: {e}", exc_info=True)
 
-    def log_signal(self, symbol, interval, signal_type, value=None, context=None, direction=None, confidence=None, window=None):
-        window_start, window_end = window if window else (None, None)
-        window_start_str = window_start.isoformat() if window_start else None
-        window_end_str = window_end.isoformat() if window_end else None
-        signal = {
-            "symbol": symbol,
-            "interval": interval,
-            "signal_type": signal_type,
-            "value": value,
-            "context": context or {},
-            "confidence": confidence,
-            "direction": direction,
-            "window_start": window_start,
-            "window_end": window_end
-        }
-        self.logger.debug(f"Logging signal: {signal}")
-        self.insert_signal_log(signal)
-        signal["window_start"] = window_start_str
-        signal["window_end"] = window_end_str
-        self.logger.debug(f"Pushing signal to Redis: {signal}")
-        self.redis_client.rpush(TRIGGER_QUEUE_CHANNEL, json.dumps(signal))
+            # mark dedupe
+            if dedupe_ts:
+                self.last_emitted[(self.market, symbol, interval)] = dedupe_ts
 
-    def insert_signal_log(self, signal):
-        cursor = self.db_conn.cursor()
-        value = float(signal.get("value")) if signal.get("value") is not None else None
-        confidence = float(signal.get("confidence")) if signal.get("confidence") is not None else None
-        try:
-            self.logger.debug(f"Inserting signal into DB: {signal}")
-            cursor.execute("""
-                INSERT INTO trading.signal_log
-                (symbol, interval, signal_type, value, context, confidence, direction, window_start, window_end)
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
-            """, (
-                signal["symbol"],
-                signal["interval"],
-                signal["signal_type"],
-                value,
-                json.dumps(signal.get("context", {})),
-                confidence,
-                signal.get("direction"),
-                signal.get("window_start"),
-                signal.get("window_end")
-            ))
-            self.db_conn.commit()
-            self.logger.info(f"🧠 Logged signal: {signal['signal_type']} for {signal['symbol']}")
-        except Exception as e:
-            self.db_conn.rollback()
-            self.logger.error(f"❌ Failed to insert signal: {e}", exc_info=True)
-        finally:
-            cursor.close()
 
-    # === Main Run ===
+    # ---- Run ----
     def run(self):
-        self.logger.info("🚀 Trigger Bot starting...")
-        self.preload_recent_klines()
-        # --- Send started status to SERVICE_STATUS_CHANNEL ---
-        started_payload = {
-            "bot_name": self.bot_name,
-            "status": "started",
-            "time": datetime.datetime.utcnow().isoformat(),
-            "auth_token": self.auth_token,
-            "metadata": {
-                "version": self.version,
-                "pid": os.getpid(),
-                "strategy": self.strategy,
-                "vitals": {}
-            }
-        }
-        self.redis_client.publish("SERVICE_STATUS_CHANNEL", json.dumps(started_payload))
-        self._start_redis_listener()
-        threading.Thread(target=self._refresh_symbols_periodically, daemon=True).start()
+        t = threading.Thread(target=self.listen, daemon=True)
+        t.start()
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            self.logger.info("🛑 Keyboard interrupt received. Stopping TriggerBot.")
             self.running = False
-            self.heartbeat.stop()  # Cleanly stop heartbeat
 
-    # === Symbol Refresh (unchanged) ===
-    def _refresh_symbols_periodically(self):
-        """Refreshes the list of symbols from the DB every 30 minutes and loads new ones."""
-        while self.running:
-            try:
-                time.sleep(1800)  # 30 minutes
-                cursor = self.db_conn.cursor()
-                cursor.execute("SET search_path TO trading;")
-                cursor.execute("SELECT symbol FROM current_coins;")
-                new_symbols = [row[0] for row in cursor.fetchall()]
-                cursor.close()
 
-                current_symbols = {key[0] for key in self.windows.keys()}
-
-                for symbol in new_symbols:
-                    if symbol not in current_symbols:
-                        for interval in ["1", "5", "60", "D"]:
-                            cursor = self.db_conn.cursor()
-                            cursor.execute(f"""
-                                SELECT symbol, interval, start_time, close, rsi, macd, volume, volume_ma
-                                FROM kline_data
-                                WHERE symbol = %s AND interval = %s
-                                ORDER BY start_time DESC
-                                LIMIT {self.WINDOW_SIZE}
-                            """, (symbol, interval))
-
-                            rows = cursor.fetchall()
-                            if rows:
-                                rows.reverse()
-                                self.windows[(symbol, interval)] = [
-                                    {
-                                        "symbol": r[0],
-                                        "interval": r[1],
-                                        "start_time": r[2],
-                                        "close": r[3],
-                                        "RSI": r[4],
-                                        "MACD": r[5],
-                                        "volume": r[6],
-                                        "Volume_MA": r[7]
-                                    }
-                                    for r in rows
-                                ]
-                                self.logger.info(f"✅ Dynamically loaded {len(rows)} candles for {symbol}-{interval}")
-                            cursor.close()
-
-            except Exception as e:
-                self.logger.error(f"❌ Error refreshing symbols: {e}")
-    def fetch_bybit_klines(self,symbol: str, interval: str = "D", limit: int = 200) -> pd.DataFrame:
-        url = "https://api.bybit.com/v5/market/kline"
-        params = {
-            "category": self.market,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status()
-        data = res.json()["result"]["list"]
-        df = pd.DataFrame(data, columns=[
-            "start_time", "open", "high", "low", "close", "volume", "turnover"
-        ])
-        df = df.astype(float)
-        df["start_time"] = pd.to_datetime(df["start_time"], unit="ms")
-        return df
 if __name__ == "__main__":
-    if sys.prefix == sys.base_prefix:
-        print("❌ Virtual environment is NOT activated. Please activate it first.")
-        sys.exit(1)
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 🚀 Starting TRIGGER_BOT...")
-    bot = TriggerBot()
-    bot.run()
+    print(time.strftime('%Y-%m-%d %H:%M:%S'), "🚀 Starting TRIGGER_BOT step 1 (wire test)...")
+    bot_linear = TriggerBot("linear")
+    bot_spot   = TriggerBot("spot")
+
+    t1 = threading.Thread(target=bot_linear.run)
+    t2 = threading.Thread(target=bot_spot.run)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
 

@@ -8,7 +8,7 @@ Maintains liveness via a modular HeartBeat service.
 Tracks klines processed per market type for monitoring.
 """
 
-import sys, os, time, json, threading, datetime, logging, pytz
+import os, time, json, threading, datetime, logging, pytz
 from collections import deque
 import pandas as pd
 from utils.logger import setup_logger
@@ -22,16 +22,20 @@ import psutil
 
 # === Master Debug Switch ===
 DEBUG = False  # Set to False to disable debug logging
+CLEAR_WINDOWS_ON_START = os.getenv("CLEAR_WINDOWS_ON_START", "0") == "1"
+WINDOW_TTL_SECONDS = int(os.getenv("WINDOW_TTL_SECONDS", "0"))  # 0 = no TTL
 
 class PreprocessorBot:
     """
+    This service serves as the QUANT TRADER exchange data source for all data interpretations
+    One instance handles all intervals and symbols
     Processes raw kline, trade, and orderbook data from Redis, enriches it, and republishes to downstream channels.
     Maintains liveness via a modular HeartBeat service.
     Tracks klines processed per market type for monitoring.
+    publishes a snapshot of each rolling window to market and symbol specific redis channel
     """
 
     def __init__(self, log_filename=config_auto.LOG_FILENAME):
-        print(f"PreprocessorBot __init__ called. PID: {os.getpid()}")
         """
         Initialize the PreprocessorBot, set up logging, Redis, heartbeat, and data structures.
         """
@@ -47,7 +51,7 @@ class PreprocessorBot:
         self.kline_windows = {}   # {(symbol, interval, market): deque}
         self.trade_windows = {}   # {(symbol, minute): [trades]}
 
-        self.market_channels = {
+        self.market_channels = { # These are the channels for which raw data flows in
             "linear": {
                 "kline": config_redis.REDIS_CHANNEL["linear.kline_out"],
                 "trade": config_redis.REDIS_CHANNEL["linear.trade_out"],
@@ -65,7 +69,7 @@ class PreprocessorBot:
             }
         }
         # Track klines processed per market type
-        self.klines_processed = {market: 0 for market in self.market_channels}
+        self.klines_processed = {market: 0 for market in self.market_channels} # A Counter to track how many it has processed for each market
         self.nans_last_heartbeat = 0
         self.nans_this_interval = 0
 
@@ -180,6 +184,7 @@ class PreprocessorBot:
     def _flush_old_trades(self):
         """
         Periodically flush old trades and publish trade summaries.
+        
         """
         while self.running:
             try:
@@ -221,12 +226,11 @@ class PreprocessorBot:
             self._publish_trade_summary(key, trades)
         self.trade_windows.clear()
 
-    # =========================
-    # Kline, Trade, and Orderbook Processing
-    # =========================
+
     def _preload_kline_window(self, symbol, interval, market):
+        # TODO: Rewrite this to get kline data from bybit.
         """
-        Preload kline window from Redis for a given symbol, interval, and market.
+        Preload kline window for a given symbol, interval, and market.
         """
         key = (symbol, interval, market)
         redis_key = f"kline_window:{market}:{symbol}:{interval}"
@@ -239,49 +243,68 @@ class PreprocessorBot:
         else:
             self.logger.info(f"No Redis window for {market}.{symbol}.{interval}. Ready to request from DB if needed.")
             return False
-
+    # =========================
+    # Kline, Trade, and Orderbook Processing
+    # =========================
     def _process_kline(self, payload, market):
         """
-        Process a kline message, enrich it, and publish the result.
-        Also updates the klines_processed counter for the market.
+        Process a kline message, compute indicators on (window + new row),
+        store the ENRICHED row in the Redis rolling window, and publish it.
         """
-        self.logger.debug(f"[DEBUG] Processing kline for {market}: {payload}")
-        symbol, interval = payload['symbol'], payload['interval']
-        redis_key = f"kline_window:{market}:{symbol}:{interval}"
-
-        # Fetch current window from Redis
-        items = self.redis_client.lrange(redis_key, -config_auto.WINDOW_SIZE, -1)
-        window = [json.loads(item) for item in items] if items else []
-
-        # Check for duplicate
-        if window:
-            last = window[-1]
-            if last['start_time'] == payload['start_time'] and last['close'] == payload['close'] and payload['market'] == last['market'] and payload['interval'] == last['interval']:
-                self.logger.debug(f"[DEBUG] Duplicate kline detected for {market}.{symbol}.{interval}. Skipping.")
-                return
-
-        payload['market'] = market
-        self.redis_client.rpush(redis_key, json.dumps(payload))
-        self.redis_client.ltrim(redis_key, -config_auto.WINDOW_SIZE, -1)
-
         try:
-            # Re-fetch window for enrichment
+            symbol = payload['symbol']
+            interval = payload['interval']
+            redis_key = f"kline_window:{market}:{symbol}:{interval}"
+
+            # read current window (enriched or not)
             items = self.redis_client.lrange(redis_key, -config_auto.WINDOW_SIZE, -1)
             window = [json.loads(item) for item in items] if items else []
-            df = pd.DataFrame(window)
-            df[["open", "close", "high", "low", "volume", "turnover"]] = df[["open", "close", "high", "low", "volume", "turnover"]].astype(float)
+
+            # duplicate guard (by start_time)
+            if window and window[-1].get('start_time') == payload.get('start_time'):
+                self.logger.debug(f"[DEBUG] Duplicate kline for {market}.{symbol}.{interval}. Skipping.")
+                return
+
+            # build combined df = existing window + new raw row
+            combined = window + [payload]
+            df = pd.DataFrame(combined)
+
+            # numeric casting
+            for c in ["open", "close", "high", "low", "volume", "turnover"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # compute indicators on the combined frame
             enriched_df = self.GlobalIndicators.compute_indicators(df.copy())
-            enriched_kline = enriched_df.iloc[-1].to_dict()
-            enriched_kline['start_time'] = df.iloc[-1]['start_time']
-            enriched_kline['market'] = market
-            nans = sum(pd.isnull(list(enriched_kline.values())))
+            enriched = enriched_df.iloc[-1].to_dict()
+
+            # ensure id fields (keep original timing/ids)
+            enriched["symbol"] = symbol
+            enriched["interval"] = interval
+            enriched["market"] = market
+            enriched["start_time"] = payload.get("start_time")
+
+            # write ENRICHED row to the rolling window (single source of truth)
+            pipe = self.redis_client.pipeline()
+            pipe.rpush(redis_key, json.dumps(enriched))
+            pipe.ltrim(redis_key, -config_auto.WINDOW_SIZE, -1)
+            if WINDOW_TTL_SECONDS > 0:
+                pipe.expire(redis_key, WINDOW_TTL_SECONDS)            
+            pipe.execute()
+
+            # counters/metrics
+            nans = sum(pd.isnull(list(enriched.values())))
             self.nans_this_interval += nans
             self.klines_processed[market] += 1
             self.status["metadata"]["vitals"]["klines_processed"] = self.klines_processed.copy()
+
+            # publish enriched tick to downstream consumers
             out_channel = config_redis.PRE_PROC_KLINE_UPDATES
-            self.redis_handler.publish(out_channel, json.dumps(enriched_kline))
+            self.redis_handler.publish(out_channel, json.dumps(enriched))
+
         except Exception as e:
             self.logger.info(f"❌ Error processing kline for {market}: {e}")
+
 
     def _process_trade(self, payload, market=None):
         """
@@ -313,6 +336,24 @@ class PreprocessorBot:
             self.logger.debug(f"📤 Published orderbook update for {payload.get('symbol', 'unknown')}")
         except Exception as e:
             self.logger.info(f"❌ Error processing orderbook for {market}: {e}")
+    def _clear_old_windows(self):
+        patterns = ["kline_window:linear:*", "kline_window:spot:*", "kline_window:derivatives:*"]
+        for pat in patterns:
+            try:
+                cursor, total = 0, 0
+                while True:
+                    cursor, keys = self.redis_client.scan(cursor=cursor, match=pat, count=500)
+                    if keys:
+                        pipe = self.redis_client.pipeline()
+                        for k in keys:
+                            pipe.delete(k)
+                        pipe.execute()
+                        total += len(keys)
+                    if cursor == 0:
+                        break
+                self.logger.info(f"🧹 Cleared {total} keys for pattern {pat}")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Failed clearing {pat}: {e}")
 
     # =========================
     # Public Interface
@@ -329,6 +370,8 @@ class PreprocessorBot:
         """
         Start the bot, connect to Redis, and begin processing messages.
         """
+        if CLEAR_WINDOWS_ON_START:
+            self._clear_old_windows()
         self._connect_redis()
         threading.Thread(target=self._listen_redis, daemon=True).start()
         threading.Thread(target=self._flush_old_trades, daemon=True).start()

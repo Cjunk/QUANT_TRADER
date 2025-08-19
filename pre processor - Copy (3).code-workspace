@@ -1,0 +1,9 @@
+{
+        "folders": [
+            {"path":"bots/preprocessor"},
+            {"path":"config"}
+        ],
+        "settings": {
+            "hide-files.files": []
+        }
+}

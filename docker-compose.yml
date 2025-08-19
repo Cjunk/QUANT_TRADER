@@ -69,6 +69,8 @@ services:
       - postgres
       - redis
     environment:
+      CLEAR_WINDOWS_ON_START: 1
+      WINDOW_TTL_SECONDS: 21600
       BOT_AUTH_TOKEN: ${PREPROCESSOR_BOT_AUTH_TOKEN}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_HOST: ${REDIS_HOST}
@@ -102,10 +104,14 @@ services:
     depends_on:
       - postgres
       - redis
+      - db_bot
     environment:
+      FORCE_SIGNAL: 0
+      LOG_CONF: 1
       BOT_AUTH_TOKEN: ${TRIGGER_BOT_AUTH_TOKEN}
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       DB_HOST: postgres
+      DB_BOT_BASE_URL: http://db_bot:8001
       DB_PORT: 5432
       DB_DATABASE: ${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
@@ -114,6 +120,7 @@ services:
       REDIS_HOST: ${REDIS_HOST}
       REDIS_PORT: ${REDIS_PORT}
       REDIS_DB: ${REDIS_DB}
+
     volumes:
       - ./bots/trigger:/app
       - ./bots/utils:/app/utils

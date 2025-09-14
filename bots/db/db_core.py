@@ -136,7 +136,7 @@ class PostgresDBBot:
                 sleep_duration = (target - now).total_seconds()
                 self.logger.info(f"Next archive scheduled in {sleep_duration / 3600:.2f} hours.")
                 time.sleep(sleep_duration)
-                self.KlineHandler._archive_kline_data()
+                self.Klinehandler._archive_kline_data()
         threading.Thread(target=scheduler, daemon=True).start()
 
     def _listen_to_redis(self):

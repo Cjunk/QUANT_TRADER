@@ -16,11 +16,11 @@ from utils.db_postgres import PostgresHandler
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "25"))
 LOG_FILENAME = os.getenv("LOG_FILENAME", "trigger_bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-MIN_CONFIDENCE = 30
+MIN_CONFIDENCE = 24
 FORCE_SIGNAL = os.getenv("FORCE_SIGNAL", "0") == "1"
-
+CONF_USE_ABS = os.getenv("CONF_USE_ABS", "1") == "1"  # default on
 # one global logger to avoid duplicate handlers
-logger = setup_logger(LOG_FILENAME, LOG_LEVEL)
+#logger = setup_logger(LOG_FILENAME, LOG_LEVEL)
 
 
 class TriggerBot:
@@ -28,7 +28,7 @@ class TriggerBot:
 
     def __init__(self, market: str):
         self.market = market
-        self.logger = logger
+        self.logger = setup_logger(LOG_FILENAME, LOG_LEVEL)
         self.running = True
         self.db = PostgresHandler(self.logger)
         self.db_conn = self.db.conn
@@ -40,6 +40,9 @@ class TriggerBot:
         self.pubsub.subscribe(PRE_PROC_KLINE_UPDATES)
         self.logger.info(f"[{self.market}] Subscribed to {PRE_PROC_KLINE_UPDATES!r}; WINDOW_SIZE={WINDOW_SIZE}")
         self.last_emitted = {}  # {(market, symbol, interval): last_candle_start_iso}
+        self.last_fire = {}     # {(market,symbol,interval): {"ts": float, "dir": "long|short", "conf": float}}
+        self.cooldown_sec = 300  # 5 min, tune later
+        self.flip_margin = 15.0  # need +15 confidence to reverse
 
     # ---- Redis helpers ----
     def _window_key(self, symbol: str, interval: str) -> str:
@@ -107,7 +110,6 @@ class TriggerBot:
             sym = payload.get("symbol")
             iv  = payload.get("interval")
             
-
             if not (mkt and sym and iv) or mkt != self.market:
                 continue
             self.logger.info(f"[rx] {mkt} {sym}-{iv}")
@@ -129,11 +131,9 @@ class TriggerBot:
         if len(win) < WINDOW_SIZE:
             return
         df = pd.DataFrame(win)
-
         # -- only act on confirmed candles (if field exists)
         if "confirmed" in df.columns and not bool(df["confirmed"].iloc[-1]):
             return
-
         # -- dedupe: only one signal per candle start_time
         dedupe_ts = None
         if "start_time" in df.columns:
@@ -143,15 +143,12 @@ class TriggerBot:
                 key = (self.market, symbol, interval)
                 if self.last_emitted.get(key) == dedupe_ts:
                     return
-
         # required + optional columns
         req = ["close", "volume", "Volume_MA", "RSI", "MACD", "MACD_Signal"]
         opt_bands = ["UpperBand", "LowerBand"]
-
         if any(c not in df.columns for c in req):
             self.logger.info(f"[{self.market}] {symbol}-{interval} waiting for indicators; have cols={sorted(df.columns)}")
             return
-
         # numeric cast
         for c in req:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -175,7 +172,7 @@ class TriggerBot:
         macd_score  = min(max(macd_slope,  -1.0),  1.0)
         rvol_score  = min(rvol / 3.0, 1.0)
         confidence  = (price_score*0.4 + rsi_score*0.25 + macd_score*0.2 + rvol_score*0.15) * 100.0
-
+        conf_for_gate = abs(confidence) if CONF_USE_ABS else confidence
         # log (include bands if present)
         if all(b in df.columns for b in opt_bands):
             self.logger.info(
@@ -186,11 +183,12 @@ class TriggerBot:
         else:
             self.logger.info(
                 f"[{self.market}] {symbol}-{interval} conf={confidence:.1f} "
-                f"rvol={rvol:.2f} rsi={df['RSI'].iloc[-1]:.1f} macd={df['MACD'].iloc[-1]:.2f}"
+                f"(gate={conf_for_gate:.1f}) rvol={rvol:.2f} "
+                f"rsi={df['RSI'].iloc[-1]:.1f} macd={df['MACD'].iloc[-1]:.2f}"
             )
 
         # emit if forced or over threshold
-        if FORCE_SIGNAL or confidence >= MIN_CONFIDENCE:
+        if FORCE_SIGNAL or conf_for_gate >= MIN_CONFIDENCE:
             direction = "long" if df["close"].iloc[-1] >= df["close"].iloc[-2] else "short"
 
             # context (includes bands if present)
@@ -215,8 +213,20 @@ class TriggerBot:
                 if len(ts_all.dropna()) > 0:
                     window_start = ts_all.min().tz_convert(None).to_pydatetime()
                     window_end   = ts_all.max().tz_convert(None).to_pydatetime()
-
-            # queue payload
+            # --- flip guard (cooldown + hysteresis) ---
+            kdir = (self.market, symbol, interval)
+            now_s = time.time()
+            last = self.last_fire.get(kdir)
+            if last and direction != last["dir"]:
+                since = now_s - last["ts"]
+                if since < self.cooldown_sec:
+                    self.logger.info(f"⏸️ Block flip {symbol}-{interval}: {since:.0f}s<{self.cooldown_sec}s since {last['dir']} "
+                                    f"(conf {last['conf']:.1f}→{confidence:.1f})")
+                    return
+                if confidence < last["conf"] + self.flip_margin:
+                    self.logger.info(f"⛔ Hysteresis {symbol}-{interval}: {confidence:.1f} < {(last['conf']+self.flip_margin):.1f}")
+                    return
+                # queue payload
             payload = {
                 "symbol": symbol,
                 "interval": interval,
@@ -228,21 +238,21 @@ class TriggerBot:
                 "context": context,
                 "window_start": window_start.isoformat() if window_start else None,
                 "window_end": window_end.isoformat() if window_end else None,
+                "timestamp": now_s,  # <-- NEW
             }
             self.client.rpush(TRIGGER_QUEUE_CHANNEL, json.dumps(payload))
             self.logger.info(f"queued signal -> {payload}")
 
-            # DB insert
             self._insert_signal_log(
                 symbol=symbol, interval=interval, signal_type=payload["signal_type"],
                 value=payload["value"], context=context, confidence=payload["confidence"],
                 direction=direction, window_start=window_start, window_end=window_end
             )
 
-            # mark dedupe
             if dedupe_ts:
                 self.last_emitted[(self.market, symbol, interval)] = dedupe_ts
 
+            self.last_fire[kdir] = {"ts": now_s, "dir": direction, "conf": float(confidence)}
 
     # ---- Run ----
     def run(self):

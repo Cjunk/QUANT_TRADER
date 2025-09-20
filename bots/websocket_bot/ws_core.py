@@ -23,7 +23,6 @@ Redis Channels Used:
 # =====================================================
 import json, threading, queue, datetime, time, logging, os
 import websocket
-
 import config_websocket_bot as cfg
 from utils import setup_logger
 from utils.redis_handler import RedisHandler
@@ -32,14 +31,12 @@ from config import config_redis as r_cfg
 from subscription_handler import SubscriptionHandler, MAX_SYMBOLS
 from message_router import MessageRouter
 from websocket_utils import send_webhook
-
 # =====================================================
 # Jericho: Configurable Constants
 # =====================================================
 BATCH_SIZE = getattr(cfg, "BATCH_SIZE", 10)
 PING_SEC, PONG_TIMEOUT, REOPEN_SEC = 20, 10, 2
 CAPTURE_ORDER_DELTAS = True
-
 # =====================================================
 # Jericho: WebSocketBot Class
 # =====================================================
@@ -70,7 +67,6 @@ class WebSocketBot(threading.Thread):
         self.sub_handler.ws_update_callback = self._update_subscriptions
         self.sub_handler.out_q = self.cmd_q
         self.sub_handler.start()
-
         # Heartbeat setup
         self.status = {
             "bot_name": f"{cfg.BOT_NAME}:{self.market}",
@@ -96,11 +92,9 @@ class WebSocketBot(threading.Thread):
             redis_handler=self.redis_handler,
             metadata=self.status
         )
-
         self.logger.info(f"[DEBUG] WebSocketBot for market '{self.market}' initialized.")
         self._connect_ws()
         threading.Thread(target=self._ws_watchdog, daemon=True).start()
-
     # =====================================================
     # Jericho: Main Run Loop
     # =====================================================
@@ -116,12 +110,9 @@ class WebSocketBot(threading.Thread):
             except queue.Empty:
                 #self.logger.debug("[DEBUG][run] cmd_q is empty, continuing loop.")
                 continue
-
-
     def _update_subscriptions(self, new_subs):
         self.logger.debug(f"*************** [DEBUG][_update_subscriptions] called with: {new_subs} (type={type(new_subs)})")
         if not self.ws:
-            self.logger.error("[DEBUG][_update_subscriptions] WebSocket object is None!")
             return
         if not self.ws.sock:
             self.logger.error("[DEBUG][_update_subscriptions] WebSocket.sock is None!")
@@ -129,15 +120,12 @@ class WebSocketBot(threading.Thread):
         if not self.ws.sock.connected:
             self.logger.warning("[DEBUG][_update_subscriptions] WebSocket not connected, skipping update.")
             return
-
         self.logger.debug(f"[DEBUG][_update_subscriptions] Preparing to update live subscriptions. Current channels: {self.channels}")
         self.logger.info(f"[DEBUG][_update_subscriptions] New subscriptions requested: {new_subs}")
-
         # Debug: Show difference between current and new
         to_sub = set(new_subs) - self.channels
         to_unsub = self.channels - set(new_subs)
         self.logger.info(f"[DEBUG][_update_subscriptions] to_sub={to_sub}, to_unsub={to_unsub}")
-
         # Unsubscribe from topics not in new_subs
         if to_unsub:
             for batch_start in range(0, len(to_unsub), BATCH_SIZE):
@@ -149,12 +137,14 @@ class WebSocketBot(threading.Thread):
                 except Exception as e:
                     self.logger.error(f"[DEBUG][_update_subscriptions] Failed to unsubscribe batch {batch}: {e}")
         self.channels -= to_unsub
-
         # Subscribe to new topics
         if to_sub:
             for batch_start in range(0, len(to_sub), BATCH_SIZE):
                 batch = list(to_sub)[batch_start:batch_start+BATCH_SIZE]
                 self.logger.info(f"[DEBUG][_update_subscriptions] Subscribing to batch: {batch}")
+                for symbol in batch:
+                    sub_type = self.market if hasattr(self, 'market') else 'unknown'
+                    self.logger.info(f"[SUBSCRIBE] Symbol: {symbol} | Type: {sub_type}")
                 try:
                     self.ws.send(json.dumps({"op": "subscribe", "args": batch}))
                     self.logger.info(f"[DEBUG][_update_subscriptions] Subscribed to batch: {batch}")
@@ -164,10 +154,8 @@ class WebSocketBot(threading.Thread):
 
         if not to_sub and not to_unsub:
             self.logger.info("[DEBUG][_update_subscriptions] No subscription changes needed.")
-
         # Final state
         self.logger.info(f"[DEBUG][_update_subscriptions] Final channels: {self.channels}")
-
     # =====================================================
     # Jericho: Shutdown Logic
     # =====================================================
@@ -191,7 +179,6 @@ class WebSocketBot(threading.Thread):
             self.sub_handler._save_subscriptions_to_redis()
         send_webhook(cfg.DISCORD_WEBHOOK, "WebSocket Bot stopped.")
         self.logger.debug("✅ Shutdown complete.")
-
     # =====================================================
     # Jericho: WebSocket Connection
     # =====================================================
@@ -205,11 +192,12 @@ class WebSocketBot(threading.Thread):
                     url,
                     on_open=lambda ws: (
                         self.logger.debug("[DEBUG][_connect_ws] WS connected"),
+                        send_webhook(cfg.DISCORD_WEBHOOK, f"WebSocket connected to {self.market}"),
                         self._update_subscriptions(set(self.sub_handler.subscriptions.keys()))
                     ),
                     on_message=self._on_message,
                     on_error=lambda ws, err: self.logger.error(f"[DEBUG][_connect_ws] WS error: {err}"),
-                    on_close=lambda *_: (self.logger.warning("[DEBUG][_connect_ws] WS closed"), self.sub_handler.channels.clear()),
+                    on_close=lambda *_: (self.logger.warning("[DEBUG][_connect_ws] WS closed"), send_webhook(cfg.DISCORD_WEBHOOK, f"WebSocket closed for {self.market}"), self.sub_handler.channels.clear()),
                     on_pong=lambda *_: self.logger.debug("[DEBUG][_connect_ws] pong"),
                 )
                 self.logger.debug("[DEBUG][_connect_ws] Starting run_forever...")
@@ -219,7 +207,6 @@ class WebSocketBot(threading.Thread):
                     self.logger.warning(f"[DEBUG][_connect_ws] Reconnecting WS in {REOPEN_SEC}s...")
                     time.sleep(REOPEN_SEC)
         threading.Thread(target=_runner, daemon=True).start()
-
     # =====================================================
     # Jericho: Watchdog & Heartbeat
     # =====================================================
@@ -249,7 +236,6 @@ class WebSocketBot(threading.Thread):
             self.logger.debug(f"[DEBUG] Received WS message: topic={topic} raw={raw[:200]}")
             if "kline" in topic:
                 _, interval, symbol = topic.split(".")
-                #self.logger.info(f"[DEBUG] KLINE DATA RECEIVED: symbol={symbol} interval={interval} data={data}")
                 # --- Kline counter ---
                 if not hasattr(self, "kline_count"):
                     self.kline_count = 0
@@ -257,10 +243,7 @@ class WebSocketBot(threading.Thread):
             elif "orderbook" in topic:
                 _, depth, symbol = topic.split(".")
                 if CAPTURE_ORDER_DELTAS:
-                    #self.logger.info(f"[ORDERBOOK DELTA] {self.market.upper()} | {symbol} | depth={depth}")
-
                     payload = data.get("data", {})
-
                 for side_key, side_label in [("b", "bid"), ("a", "ask")]:
                     if side_key in payload:
                         for entry in payload[side_key]:
@@ -286,15 +269,9 @@ class WebSocketBot(threading.Thread):
                                 self.logger.error(f"Redis publish failed for entry: {entry} | Error: {e}")
 
 
-
-                    #self.redis_handler.publish(
-                        #r_cfg.REDIS_CHANNEL[f"{self.market}.orderbook_delta"],
-                        #json.dumps({"symbol": symbol, "depth": depth, "data": data})
-                    #)
-                #self.logger.info(f"[DEBUG] ORDERBOOK DATA RECEIVED: symbol={symbol} depth={depth} data={data}")
             elif "publicTrade" in topic:
                 _, symbol = topic.split(".")
-                #self.logger.info(f"[DEBUG] TRADE DATA RECEIVED: symbol={symbol} data={data}")
+
             # Jericho: SEQ GAP Debugging (remove when resolved)
             if "orderbook" in topic and "seq_gap" in data.get("type", "").lower():
                 symbol = data.get("symbol", "?")
@@ -313,12 +290,3 @@ class WebSocketBot(threading.Thread):
                 self.router.orderbook(data)
         except Exception as exc:
             self.logger.error(f"Parse fail: {exc}  ¹ first 120 chars: {raw[:120]}")
-
-
-
-
-
-
-
-
-

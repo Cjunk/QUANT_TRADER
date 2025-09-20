@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"name": "config",
+			"path": "bots/config"
+		},
+		{
+			"path": "bots/websocket_bot"
+		},
+		{
+			"path": "bots/utils"
+		}
+	],
+	"settings": {
+		"hide-files.files": [
+			"/c:/DEVELOPER/QUANT TRADER/QUANT_TRADER",
+			"/c:/DEVELOPER/QUANT TRADER/QUANT_TRADER/config/config_ws.py",
+			"/c:/DEVELOPER/QUANT TRADER/QUANT_TRADER/config/config_wallet.py",
+			"/c:/DEVELOPER/QUANT TRADER/QUANT_TRADER/bots/config/config_trigger_bot.py"
+		],
+		"python.defaultInterpreterPath": "C:\\DEVELOPER\\QUANT TRADER\\QUANT_TRADER\\venv\\Scripts\\python.exe",
+		"python.analysis.extraPaths": [
+			"C:\\DEVELOPER\\QUANT TRADER\\QUANT_TRADER\\bots",
+			"C:\\DEVELOPER\\QUANT TRADER\\QUANT_TRADER\\config"
+		]
+	}
+}

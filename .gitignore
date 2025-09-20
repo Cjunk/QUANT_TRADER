@@ -16,3 +16,9 @@ mybot.code-workspace*
 QuantTradingBots/
 BIN/
 testaccount.py
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
